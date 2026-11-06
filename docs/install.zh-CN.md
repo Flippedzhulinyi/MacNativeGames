@@ -243,6 +243,7 @@ python3.14 games/totk/ios/tools/install_device.py "<文件夹>/TOTK-Vision.app" 
 以下是王国之泪的路径；旷野之息把 `TOTK` 换成 `BotW`、`totk` 换成 `botw`。
 
 - 存档：`~/Library/Application Support/MacNativeGames/TOTK/profile`
+- Mac 上可用[离线存档修改器](offline-save-editor.zh-CN.md)调整已有箭和素材数量、卢比，以及武器盾牌弓的耐久，并可从游戏装备目录添加新装备；每次修改前会备份。
 - 着色器缓存：`~/Library/Application Support/MacNativeGames/TOTK/shader-cache`
 - 公共清单里还没有的着色器：`~/Library/Application Support/MacNativeGames/TOTK/shader-list-contribution.txt`。游戏启动前会问要不要发送，见[公共着色器清单](shader-list.md)。
 - 模组：`~/Library/Application Support/MacNativeGames/TOTK/mods/<v0|v112|v121|v143>`，见 [mods.md](mods.md)。
