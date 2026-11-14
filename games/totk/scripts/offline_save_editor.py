@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, ttk
+from urllib.error import URLError
+from urllib.request import urlopen
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -19,6 +21,8 @@ _CATEGORY_TO_STORAGE = {
     "盾牌": "Shield",
     "弓": "Bow",
     "卢比": "Rupee",
+    "重要物品": "KeyItem",
+    "左纳乌装置": "SpecialParts",
 }
 
 BG = "#F2F5F3"
@@ -34,6 +38,7 @@ NAME_SOURCE_CONFIG = core.DATA_DIR / "save-editor-romfs-path.txt"
 
 
 def _show_dialog(parent, title, message, confirm=False, warning=False):
+    previous_grab = parent.grab_current()
     dialog = tk.Toplevel(parent)
     dialog.title(title)
     dialog.transient(parent.winfo_toplevel())
@@ -98,8 +103,8 @@ def _show_dialog(parent, title, message, confirm=False, warning=False):
     dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
     dialog.grab_set()
     dialog.wait_window()
-    if parent_window.winfo_exists() and parent_window.winfo_viewable():
-        parent_window.grab_set()
+    if previous_grab and previous_grab.winfo_exists():
+        previous_grab.grab_set()
     return result["confirmed"]
 
 
@@ -223,6 +228,11 @@ class SaveEditor:
         )
         self.lightroots_button.pack(side="left", padx=(8, 0))
         self.lightroots_button.configure(state="disabled")
+        self.extra_button = self._button(
+            details_row, "蓝图与装置…", self.open_extra_actions, secondary=True
+        )
+        self.extra_button.pack(side="left", padx=(8, 0))
+        self.extra_button.configure(state="disabled")
 
         self._section_heading(body, "02", "选择物品或装备",
                               "编辑物品、卢比数量或已有装备耐久")
@@ -483,6 +493,8 @@ class SaveEditor:
             wanted = _CATEGORY_TO_STORAGE.get(self.category_var.get())
             if wanted in ("Weapon", "Shield", "Bow"):
                 all_items = core.equipment_for_slot(self.selected_slot)
+            elif wanted in ("KeyItem", "SpecialParts"):
+                all_items = core.read_extra_items(self.selected_slot.progress_path, wanted)
             else:
                 all_items = core.inventory_for_slot(self.selected_slot)
         except (OSError, ValueError) as error:
@@ -525,7 +537,7 @@ class SaveEditor:
         self.limit_note.configure(
             text=("装备耐久上限按游戏数据和耐久强化词条计算"
                   if is_equipment else
-                  "物品数量范围 0–999     ·     修改前备份整个存档槽")
+                  "数量上限按物品显示     ·     修改前备份整个存档槽")
         )
         self._set_inventory_enabled(bool(self.items))
         if not self.items:
@@ -576,7 +588,8 @@ class SaveEditor:
                   if is_equipment else
                   "卢比范围 0–999,999     ·     修改前备份整个存档槽"
                   if is_rupees else
-                  "物品数量范围 0–999     ·     修改前备份整个存档槽")
+                  f"数量范围 0–{maximum:,}     ·     修改前备份整个存档槽"
+                  if maximum is not None else "没有可靠上限，无法修改")
         )
         self._update_apply_state()
 
@@ -611,10 +624,188 @@ class SaveEditor:
         self.lightroots_button.configure(
             state="normal" if can_add else "disabled"
         )
+        self.extra_button.configure(state="normal" if can_add else "disabled")
 
     def set_to_maximum(self):
         if self.selected_item and self.selected_item.maximum is not None:
             self.quantity_var.set(str(self.selected_item.maximum))
+
+    def open_extra_actions(self):
+        if not self.selected_slot or not self.offline_verified or self.game_running:
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("蓝图与左纳乌装置")
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        frame = tk.Frame(dialog, bg=CARD, padx=22, pady=20)
+        frame.pack(fill="both", expand=True)
+        tk.Label(
+            frame, text=f"目标存档：{self.selected_slot.label}", bg=CARD,
+            fg=INK, font=("SF Pro Text", 10), wraplength=500,
+        ).pack(anchor="w", pady=(0, 12))
+        tk.Label(
+            frame, text="精选战斗蓝图（需要联网下载社区作品）",
+            bg=CARD, fg=INK, font=("SF Pro Text", 11, "bold"),
+        ).pack(anchor="w")
+        choices = {value[0]: key for key, value in core.BLUEPRINTS.items()}
+        selected = tk.StringVar(value=next(iter(choices)))
+        ttk.Combobox(
+            frame, textvariable=selected, values=tuple(choices),
+            state="readonly", width=42,
+        ).pack(fill="x", pady=(8, 8))
+
+        def reset_thumbnails(parent):
+            if not _show_dialog(
+                parent, "重建缩略图缓存",
+                "将完整备份并移走当前 profile 的游戏缓存，不修改存档。"
+                "这会影响该 profile 所有存档的蓝图、武器、盾牌等缓存缩略图，"
+                "游戏下次启动后可尝试重新生成；期间图片可能暂时为空，"
+                "不保证所有缩略图都能恢复。"
+                "备份会保留，不自动清理。\n\n"
+                "游戏必须完全关闭，继续吗？", confirm=True,
+            ):
+                return
+            try:
+                backup = core.reset_thumbnail_cache(profile=self.profile)
+            except (OSError, ValueError) as error:
+                _show_dialog(parent, "缩略图缓存未重置", str(error), warning=True)
+                return
+            message = f"旧缓存已备份至：\n{backup}\n\n请启动游戏并读取存档，检查缩略图。"
+            self.status_var.set(f"缩略图缓存已备份；{backup}")
+            _show_dialog(parent, "缩略图缓存已重置", message)
+
+        def finish(result, title, blueprint=False):
+            dialog.destroy()
+            self.refresh_saves()
+            if not result["changed"]:
+                _show_dialog(self.root, title, "数据已是目标状态，无需修改。")
+                return
+            details = f"备份位置：\n{result['backup']}"
+            if result["cleanup_errors"]:
+                details += "\n\n旧备份清理未完成：" + "；".join(result["cleanup_errors"])
+            self.status_var.set(f"{title}；{details}")
+            _show_dialog(self.root, title, details, warning=bool(result["cleanup_errors"]))
+            if blueprint:
+                reset_thumbnails(self.root)
+
+        def confirm_blueprint(slot, source):
+            try:
+                target = core.preview_blueprint_target(slot, profile=self.profile)
+            except (OSError, ValueError) as error:
+                _show_dialog(dialog, "蓝图未添加", str(error))
+                return None
+            if target.replaces_history:
+                destination = (
+                    f"将覆盖未收藏的蓝图历史编号 {target.history_index + 1}"
+                    f"（内部索引 {target.history_index}，记录槽 {target.slot_index + 1}）。"
+                    "原有历史记录会被替换；不会覆盖已收藏的蓝图。"
+                )
+            else:
+                destination = (
+                    f"将使用空蓝图记录槽 {target.slot_index + 1}，"
+                    "不会覆盖已有蓝图。"
+                )
+            if not _show_dialog(
+                dialog, "添加蓝图",
+                f"{source}\n\n{destination}\n\n"
+                "需要有收藏空位，导入后新蓝图会被收藏。\n\n"
+                "需在游戏中已解锁蓝图重现；社区蓝图的游戏内效果尚未验证。\n\n"
+                "操作会备份此存档槽，成功后仅保留此槽最新备份；"
+                "连续导入不能逐次撤销所有覆盖。"
+                "游戏必须保持关闭，继续吗？", confirm=True,
+            ):
+                return None
+            return target
+
+        def add_blueprint():
+            blueprint_id = choices.get(selected.get())
+            if not blueprint_id:
+                _show_dialog(dialog, "无法添加蓝图", "请选择蓝图。")
+                return
+            slot = self.selected_slot
+            target = confirm_blueprint(
+                slot, "将从 HyruleWorks 下载所选蓝图并校验；不会上传存档。"
+            )
+            if target is None:
+                return
+            try:
+                with urlopen(core.BLUEPRINTS[blueprint_id][1], timeout=20) as response:
+                    payload = response.read(6713)
+                result = core.import_blueprint(
+                    slot, blueprint_id, payload, profile=self.profile, target=target,
+                )
+            except (OSError, ValueError, URLError) as error:
+                _show_dialog(dialog, "蓝图未添加", str(error))
+                return
+            finish(result, "蓝图已添加，请在游戏中验证", blueprint=True)
+
+        self._button(frame, "下载并添加所选蓝图", add_blueprint, primary=True).pack(
+            anchor="w", pady=(0, 8)
+        )
+
+        def add_local_blueprint():
+            path = filedialog.askopenfilename(
+                parent=dialog, title="选择本地蓝图",
+                filetypes=(("蓝图文件", "*.cai"), ("所有文件", "*")),
+            )
+            if not path:
+                return
+            try:
+                with open(path, "rb") as stream:
+                    payload = stream.read(6713)
+                core.validate_blueprint_payload(payload)
+            except (OSError, ValueError) as error:
+                _show_dialog(dialog, "蓝图未添加", str(error))
+                return
+            slot = self.selected_slot
+            target = confirm_blueprint(
+                slot, f"本地蓝图：{Path(path).name}\n"
+                "只检查文件长度、标识和镜头数据，不保证蓝图内容安全或兼容；"
+                "不会上传文件或存档。"
+            )
+            if target is None:
+                return
+            try:
+                result = core.import_local_blueprint(
+                    slot, payload, profile=self.profile, target=target,
+                )
+            except (OSError, ValueError) as error:
+                _show_dialog(dialog, "蓝图未添加", str(error))
+                return
+            finish(result, "蓝图已添加，请在游戏中验证", blueprint=True)
+
+        self._button(frame, "导入本地蓝图…", add_local_blueprint, secondary=True).pack(
+            anchor="w", pady=(0, 8)
+        )
+        self._button(
+            frame, "重建缩略图缓存…", lambda: reset_thumbnails(dialog), secondary=True
+        ).pack(
+            anchor="w", pady=(0, 16)
+        )
+
+        def complete():
+            if not _show_dialog(
+                dialog, "补齐左纳乌装置",
+                "将 27 种装置中未拥有的加入空槽，并把所有装置数量设为 999。"
+                "不会覆盖已有物品；空槽不足会取消。\n\n"
+                "操作会备份此存档槽，成功后仅保留此槽最新备份。"
+                "游戏必须保持关闭，继续吗？", confirm=True,
+            ):
+                return
+            try:
+                result = core.complete_devices(self.selected_slot, profile=self.profile)
+            except (OSError, ValueError) as error:
+                _show_dialog(dialog, "装置未修改", str(error))
+                return
+            finish(result, "装置已补齐，请在游戏中验证")
+
+        self._button(frame, "补齐装置并设为上限", complete, secondary=True).pack(anchor="w")
+        tk.Label(
+            frame, text="蓝图与新增装置的游戏内效果尚需读档验证。",
+            bg=CARD, fg=MUTED, font=("SF Pro Text", 9),
+        ).pack(anchor="w", pady=(12, 0))
+        dialog.update_idletasks()
+        dialog.grab_set()
 
     def activate_lightroots(self):
         if not self.selected_slot or not self.offline_verified or self.game_running:
@@ -874,6 +1065,9 @@ class SaveEditor:
             self.root,
             "备份并应用修改",
             f"将 {item.label.split(' · ')[0]} 的{measure}从 {old_value} 改为 {value}。\n\n"
+            + ("只更改持有数量，不会同步收集或剧情进度；游戏内效果需验证。\n\n"
+               if item.category == "KeyItem" else "")
+            +
             "修改前会备份整个存档槽。游戏必须保持关闭，继续吗？",
             confirm=True,
         )

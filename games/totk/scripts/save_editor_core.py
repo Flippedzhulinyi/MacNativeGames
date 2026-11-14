@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import fcntl
 import hashlib
+import math
 import os
 from pathlib import Path
 import re
@@ -23,6 +24,36 @@ DEFAULT_PROFILE = DATA_DIR / "profile"
 GAME_SLOT_DIR = Path(os.environ.get("TOTK_GAME_SLOT_DIR", DATA_DIR / "game-slot"))
 MAX_STACK = 999
 MAX_RUPEES = 999_999
+_MATERIAL_MAXIMUMS = {"Item_Ore_L": 999_999, "Item_Ore_M": 999_999}
+_KEY_ITEM_MAXIMUMS = {"Energy_Material_01": 999_999, "Obj_KorokNuts": 1000}
+DEVICE_IDS = (
+    "SpObj_WindGenerator_Capsule_A_01", "SpObj_LiftGeneratorWing_Capsule_A_01",
+    "SpObj_Cart_Capsule_A_01", "SpObj_BalloonEnvelope_Capsule_A_01",
+    "SpObj_Rocket_Capsule_A_01", "SpObj_TimerBomb_Capsule_A_01",
+    "SpObj_CookSet_Capsule_A_01", "SpObj_FlameThrower_Capsule_A_01",
+    "SpObj_SnowMachine_Capsule_A_01", "SpObj_ElectricBoxGenerator_Capsule_A_01",
+    "SpObj_Beamos_Capsule_A_01", "SpObj_LiftableWaterPump_Capsule_A_01",
+    "SpObj_ControlStick_Capsule_A_01", "SpObj_FastWheel_Capsule_B_01",
+    "SpObj_FastWheel_Capsule_A_01", "SpObj_SlipBoard_Capsule_A_01",
+    "SpObj_EnergyBank_Capsule_A_01", "SpObj_EnergyBank_Capsule_A_02",
+    "SpObj_SpringPiston_Capsule_A_01", "SpObj_Cannon_Capsule_A_01",
+    "SpObj_TiltingDoll_Capsule_A_01", "SpObj_FloatingStone_Capsule_A_01",
+    "SpObj_FlashLight_Capsule_A_01", "SpObj_Pile_Capsule_A_01",
+    "SpObj_LightMirror_Capsule_A_01", "SpObj_Chaser_Capsule_A_01",
+    "SpObj_GolemHead_Capsule_A_01",
+)
+BLUEPRINTS = {
+    "siege_craft": (
+        "攻城飞行器 · 激光与大炮",
+        "https://d2fvvq21pbg82w.cloudfront.net/files/710c3d0d-3efb-48cb-a229-0ab99797e8ce/blueprint_1782539969898.cai",
+        "3c1abc5399ee877a48f5d9b798e7aa7d333c37b11544ec6024c8c2426763be77",
+    ),
+    "siege_tank": (
+        "攻城坦克 · 激光与大炮",
+        "https://d2fvvq21pbg82w.cloudfront.net/files/710c3d0d-3efb-48cb-a229-0ab99797e8ce/blueprint_1782539812844.cai",
+        "a167cdec4d1bd62beb2fe32c6bdb9e8290e80234311e6042c705be8431842207",
+    ),
+}
 _RUPEE_FIELD = "PlayerStatus.CurrentRupee"
 _LIGHTROOT_INDICES = (
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
@@ -38,7 +69,11 @@ _LIGHTROOT_OPEN = 0x1818EC02
 _LIGHTROOT_CLOSE = 0x8A88C430
 _MAGIC = 0x01020304
 _TABLE_HEADER_SIZE = 32
-_LABELS = {"NormalArrow": "普通箭", **MATERIAL_NAMES_ZH_CN}
+_BASE_LABELS = {
+    "NormalArrow": "普通箭", "Energy_Material_01": "左纳乌能源结晶",
+    "Obj_KorokNuts": "克洛格的果实",
+}
+_LABELS = {**MATERIAL_NAMES_ZH_CN, **_BASE_LABELS}
 _LOCATION_LABELS = {
     "MainField": "海拉鲁大陆",
     "HopesPlateau": "初始空岛",
@@ -68,7 +103,7 @@ class SaveFormatError(ValueError):
 
 def set_game_item_names(names):
     _LABELS.clear()
-    _LABELS.update({**MATERIAL_NAMES_ZH_CN, **names, "NormalArrow": "普通箭"})
+    _LABELS.update({**MATERIAL_NAMES_ZH_CN, **names, **_BASE_LABELS})
 
 
 @dataclass(frozen=True)
@@ -84,7 +119,8 @@ class InventoryItem:
         display = _LABELS.get(self.item_id)
         if display is None:
             display = f"未收录名称（{self.item_id}）"
-        category = "箭" if self.category == "Arrow" else "素材"
+        category = {"Arrow": "箭", "Material": "素材", "KeyItem": "重要物品",
+                    "SpecialParts": "左纳乌装置"}[self.category]
         return f"{display} · {category} · {self.quantity}/{self.maximum}"
 
 
@@ -329,6 +365,59 @@ def _inventory_layout(data):
     return layout
 
 
+def _quantity_maximum(category, item_id):
+    if category == "KeyItem":
+        return _KEY_ITEM_MAXIMUMS.get(item_id)
+    if category == "SpecialParts" and item_id not in DEVICE_IDS:
+        return None
+    if category == "Material":
+        return _MATERIAL_MAXIMUMS.get(item_id, MAX_STACK)
+    return MAX_STACK
+
+
+def _extra_pouch_layout(data, category):
+    fields = _parse_field_table(data)
+    prefix = f"Pouch.{category}.Content"
+    names, count = _array_field(data, fields, prefix + ".Name", 17, 64)
+    stocks, stock_count = _array_field(data, fields, prefix + ".StockNum", 3, 4)
+    if count != stock_count or count % 2:
+        raise SaveFormatError(f"{category} 背包数组不匹配。")
+    ranges = [(names - 4, names + count * 64), (stocks - 4, stocks + count * 4)]
+    order = None
+    if category == "SpecialParts":
+        order, order_count = _array_field(data, fields, prefix + ".UseOrder", 3, 4)
+        if order_count != count:
+            raise SaveFormatError("左纳乌装置使用顺序数组不匹配。")
+        ranges.append((order - 4, order + count * 4))
+    for index, (start, end) in enumerate(ranges):
+        if any(start < other_end and other_start < end
+               for other_start, other_end in ranges[index + 1:]):
+            raise SaveFormatError("背包字段存储区域重叠。")
+    return names, stocks, count // 2, order
+
+
+def read_extra_items(progress_path, category):
+    if category not in ("KeyItem", "SpecialParts"):
+        raise ValueError("不支持此背包类别。")
+    data = Path(progress_path).read_bytes()
+    names, stocks, count, _ = _extra_pouch_layout(data, category)
+    items = []
+    for index in range(count):
+        item_id = _read_string(data, names + index * 64, 64)
+        if not item_id:
+            continue
+        maximum = _quantity_maximum(category, item_id)
+        if maximum is None:
+            if category == "SpecialParts":
+                raise SaveFormatError(f"发现不受支持的左纳乌装置：{item_id}")
+            continue
+        quantity = struct.unpack_from("<i", data, stocks + index * 4)[0]
+        if quantity < 0 or quantity > maximum:
+            raise SaveFormatError(f"{item_id} 数量不在支持范围内。")
+        items.append(InventoryItem(item_id, category, index, quantity, maximum))
+    return items
+
+
 def read_inventory(progress_path):
     data = Path(progress_path).read_bytes()
     layout = _inventory_layout(data)
@@ -341,11 +430,12 @@ def read_inventory(progress_path):
                 continue
             if not re.fullmatch(r"[A-Za-z0-9_]+", item_id) or quantity < 0:
                 raise SaveFormatError("背包物品记录无效，拒绝显示或修改。")
-            if quantity > MAX_STACK:
+            maximum = _quantity_maximum(category, item_id)
+            if quantity > maximum:
                 raise SaveFormatError(
                     f"{item_id} 的数量已超过游戏上限，拒绝修改。"
                 )
-            items.append(InventoryItem(item_id, category, index, quantity))
+            items.append(InventoryItem(item_id, category, index, quantity, maximum))
     return items
 
 
@@ -731,12 +821,15 @@ def set_item_quantity(slot, item_id, category, quantity,
         return set_rupees(
             slot, quantity, profile=profile, slot_dir=slot_dir
         )
-    if category not in ("Arrow", "Material"):
-        raise ValueError("目前只支持箭和素材的数量修改。")
+    if category not in ("Arrow", "Material", "KeyItem", "SpecialParts"):
+        raise ValueError("不支持此物品类别的数量修改。")
+    maximum = _quantity_maximum(category, item_id)
+    if maximum is None:
+        raise ValueError("该物品没有经过验证的数量上限。")
     if isinstance(quantity, bool) or not isinstance(quantity, int):
         raise ValueError("数量必须是整数。")
-    if quantity < 0 or quantity > MAX_STACK:
-        raise ValueError(f"数量必须在 0 到 {MAX_STACK} 之间。")
+    if quantity < 0 or quantity > maximum:
+        raise ValueError(f"数量必须在 0 到 {maximum} 之间。")
 
     directory, progress, backup_root = _save_edit_paths(slot, profile)
 
@@ -744,8 +837,12 @@ def set_item_quantity(slot, item_id, category, quantity,
         current = progress.read_bytes()
         if hashlib.sha256(current).hexdigest() != slot.digest:
             raise ValueError("存档在载入后发生了变化。请重新扫描后再修改。")
-        layout = _inventory_layout(current)
-        names, stocks, regular_slots = layout[category]
+        if category in ("KeyItem", "SpecialParts"):
+            layout = _extra_pouch_layout(current, category)
+            names, stocks, regular_slots, _ = layout
+        else:
+            layout = _inventory_layout(current)
+            names, stocks, regular_slots = layout[category]
         if item_index is None:
             index = next(
                 (i for i in range(regular_slots)
@@ -761,7 +858,7 @@ def set_item_quantity(slot, item_id, category, quantity,
         if index is None:
             raise ValueError("所选物品已不在该存档中，请重新扫描。")
         current_quantity = struct.unpack_from("<i", current, stocks + index * 4)[0]
-        if current_quantity < 0 or current_quantity > MAX_STACK:
+        if current_quantity < 0 or current_quantity > maximum:
             raise ValueError("物品数量不在可支持范围内，拒绝修改。")
         if current_quantity == quantity:
             return {"changed": False, "quantity": quantity, "backup": None}
@@ -771,12 +868,224 @@ def set_item_quantity(slot, item_id, category, quantity,
         result = _commit_save_edit(
             slot, directory, progress, current, modified, backup_root,
             lambda data: (
-                _inventory_layout(data) == layout and
-                struct.unpack_from("<i", data, stocks + index * 4)[0] ==
-                quantity
+                data == bytes(modified) and
+                (_extra_pouch_layout(data, category) == layout
+                 if category in ("KeyItem", "SpecialParts")
+                 else _inventory_layout(data) == layout)
             ),
         )
         result["quantity"] = quantity
+        return result
+
+
+def complete_devices(slot, profile=DEFAULT_PROFILE, slot_dir=GAME_SLOT_DIR):
+    directory, progress, backup_root = _save_edit_paths(slot, profile)
+    with game_lock(slot_dir):
+        current = progress.read_bytes()
+        if hashlib.sha256(current).hexdigest() != slot.digest:
+            raise ValueError("存档在载入后发生了变化。请重新扫描后再修改。")
+        names, stocks, count, orders = _extra_pouch_layout(current, "SpecialParts")
+        found, empty = {}, []
+        for i in range(count):
+            name_offset = names + i * 64
+            item_id = _read_string(current, name_offset, 64)
+            quantity = struct.unpack_from("<i", current, stocks + i * 4)[0]
+            order = struct.unpack_from("<i", current, orders + i * 4)[0]
+            if item_id:
+                if item_id not in DEVICE_IDS or item_id in found or not 0 <= quantity <= MAX_STACK:
+                    raise SaveFormatError("装置背包存在未知、重复或数量异常的记录。")
+                found[item_id] = i
+            elif (current[name_offset:name_offset + 64] == b"\0" * 64 and
+                  quantity == -1 and order == -1):
+                empty.append(i)
+        missing = [item_id for item_id in DEVICE_IDS if item_id not in found]
+        if len(empty) < len(missing):
+            raise ValueError("可验证的装置空槽不足，不会覆盖现有物品。")
+        modified = bytearray(current)
+        for item_id, i in zip(missing, empty):
+            encoded = item_id.encode("ascii")
+            modified[names + i * 64:names + (i + 1) * 64] = encoded.ljust(64, b"\0")
+            struct.pack_into("<i", modified, orders + i * 4, 0)
+            found[item_id] = i
+        for i in found.values():
+            struct.pack_into("<i", modified, stocks + i * 4, MAX_STACK)
+        if modified == current:
+            return {"changed": False, "added": 0, "backup": None}
+        result = _commit_save_edit(
+            slot, directory, progress, current, modified, backup_root,
+            lambda data: data == bytes(modified) and
+            _extra_pouch_layout(data, "SpecialParts") == (names, stocks, count, orders),
+        )
+        result["added"] = len(missing)
+        return result
+
+
+def _blueprint_layout(data):
+    fields = _parse_field_table(data)
+    prefix = "AutoBuilder.Draft.Content."
+    indices, count = _array_field(data, fields, prefix + "Index", 3, 4)
+    cameras, count_pos = _array_field(data, fields, prefix + "CameraPos", 11, 12)
+    targets, count_at = _array_field(data, fields, prefix + "CameraAt", 11, 12)
+    favorite = fields.get(field_hash(prefix + "IsFavorite"))
+    blobs = fields.get(field_hash(prefix + "CombinedActorInfo"))
+    if not favorite or favorite[0] != 1 or not blobs or blobs[0] != 19:
+        raise SaveFormatError("蓝图收藏或内容字段缺失。")
+    if count != 30 or count_pos != count or count_at != count:
+        raise SaveFormatError("蓝图数组长度不受支持。")
+    fav = favorite[1]
+    blob = blobs[1]
+    if (fav < _read_u32(data, 8) or fav % 4 or
+            _read_u32(data, fav) != count or
+            blob < _read_u32(data, 8) or blob % 4 or
+            _read_u32(data, blob) != count or
+            blob + 4 + count * 6692 > len(data)):
+        raise SaveFormatError("蓝图存储布局无效。")
+    for i in range(count):
+        if _read_u32(data, blob + 4 + i * 6692) != 6688:
+            raise SaveFormatError("蓝图记录长度不受支持。")
+    ranges = [(indices - 4, indices + count * 4),
+              (cameras - 4, cameras + count * 12),
+              (targets - 4, targets + count * 12),
+              (fav, fav + 8), (blob, blob + 4 + count * 6692)]
+    for i, (start, end) in enumerate(ranges):
+        if end > len(data) or any(start < b and a < end for a, b in ranges[i + 1:]):
+            raise SaveFormatError("蓝图字段越界或重叠。")
+    return indices, cameras, targets, fav + 4, blob + 4, count
+
+
+@dataclass(frozen=True)
+class BlueprintTarget:
+    slot_index: int
+    history_index: Optional[int]
+    digest: str
+
+    @property
+    def replaces_history(self):
+        return self.history_index is not None
+
+
+def _blueprint_target(data, digest):
+    indices, _, _, favorite, _, count = _blueprint_layout(data)
+    flags = _read_u32(data, favorite)
+    if (flags & ((1 << count) - 1)).bit_count() >= 8:
+        raise ValueError("蓝图收藏已满 8 个；请先在游戏中取消部分收藏。")
+    values = struct.unpack_from(f"<{count}i", data, indices)
+    if any(value < -1 or value > 1_000_000 for value in values):
+        raise SaveFormatError("蓝图序号不受支持。")
+    if any(value == -1 and flags & (1 << i) for i, value in enumerate(values)):
+        raise SaveFormatError("空蓝图记录被标记为收藏，无法安全导入。")
+    occupied = [value for value in values if value >= 0]
+    if len(set(occupied)) != len(occupied):
+        raise SaveFormatError("蓝图历史序号重复，无法安全确定覆盖顺序。")
+    empty = next((i for i, value in enumerate(values)
+                  if value == -1 and not flags & (1 << i)), None)
+    if empty is not None:
+        if max(values, default=-1) >= 1_000_000:
+            raise SaveFormatError("蓝图序号超过支持范围。")
+        return BlueprintTarget(empty, None, digest)
+    available = [(value, i) for i, value in enumerate(values)
+                 if value >= 0 and not flags & (1 << i)]
+    if not available:
+        raise ValueError("没有可覆盖的未收藏蓝图记录。")
+    history_index, slot_index = max(available)
+    return BlueprintTarget(slot_index, history_index, digest)
+
+
+def preview_blueprint_target(slot, profile=DEFAULT_PROFILE,
+                             slot_dir=GAME_SLOT_DIR):
+    _, progress, _ = _save_edit_paths(slot, profile)
+    with game_lock(slot_dir):
+        current = progress.read_bytes()
+        digest = hashlib.sha256(current).hexdigest()
+        if digest != slot.digest:
+            raise ValueError("存档在载入后发生了变化。请重新扫描后再修改。")
+        return _blueprint_target(current, digest)
+
+
+def reset_thumbnail_cache(profile=DEFAULT_PROFILE, slot_dir=GAME_SLOT_DIR):
+    profile = Path(profile).expanduser()
+    cache_parent = profile / "cache"
+    cache = cache_parent / "0"
+    backup_root = profile / "save-editor-cache-backups"
+    with game_lock(slot_dir):
+        if any(path.is_symlink() for path in (profile, cache_parent, cache, backup_root)):
+            raise ValueError("缓存或备份路径不能是符号链接。")
+        if not profile.is_dir() or not (profile / "save").is_dir():
+            raise ValueError("所选 profile 不是有效的存档资料夹。")
+        if not cache.is_dir():
+            raise ValueError("未找到缓存目录；游戏可能尚未创建缓存或已经重置。")
+        manifest = _tree_manifest(cache)
+        if "storage/CacheStorageInfo.dat" not in manifest or "icon/" not in manifest:
+            raise SaveFormatError("缓存布局不受支持，未做任何修改。")
+        backup_root.mkdir(mode=0o700, exist_ok=True)
+        if backup_root.is_symlink() or not backup_root.is_dir():
+            raise ValueError("缓存备份路径不是普通资料夹。")
+        backup_dir = Path(tempfile.mkdtemp(prefix="cache-", dir=backup_root))
+        backup = backup_dir / "cache-0"
+        os.rename(cache, backup)
+        try:
+            if _tree_manifest(backup) != manifest:
+                raise OSError("缓存备份校验失败。")
+        except (OSError, ValueError) as error:
+            try:
+                if cache.exists() or cache.is_symlink():
+                    raise OSError("原缓存位置已被占用。")
+                os.rename(backup, cache)
+            except OSError as restore_error:
+                raise OSError(f"缓存校验失败，无法自动恢复；原缓存位于 {backup}：{restore_error}") from error
+            raise OSError("缓存备份校验失败，已恢复原缓存。") from error
+        return backup
+
+
+def validate_blueprint_payload(payload):
+    if len(payload) != 6712 or payload[:6] != b"CmbAct":
+        raise ValueError("蓝图文件格式或长度不受支持，拒绝导入。")
+    if not all(math.isfinite(value) for value in struct.unpack_from("<6f", payload, 6688)):
+        raise ValueError("蓝图镜头数据无效。")
+
+
+def import_blueprint(slot, blueprint_id, payload, profile=DEFAULT_PROFILE,
+                     slot_dir=GAME_SLOT_DIR, target=None):
+    if blueprint_id not in BLUEPRINTS:
+        raise ValueError("未知的精选蓝图。")
+    if hashlib.sha256(payload).hexdigest() != BLUEPRINTS[blueprint_id][2]:
+        raise ValueError("蓝图文件不完整或校验失败，拒绝导入。")
+    return import_local_blueprint(slot, payload, profile, slot_dir, target)
+
+
+def import_local_blueprint(slot, payload, profile=DEFAULT_PROFILE,
+                           slot_dir=GAME_SLOT_DIR, target=None):
+    validate_blueprint_payload(payload)
+    directory, progress, backup_root = _save_edit_paths(slot, profile)
+    with game_lock(slot_dir):
+        current = progress.read_bytes()
+        if hashlib.sha256(current).hexdigest() != slot.digest:
+            raise ValueError("存档在载入后发生了变化。请重新扫描后再修改。")
+        layout = _blueprint_layout(current)
+        indices, cameras, targets, favorite, blobs, count = layout
+        flags = _read_u32(current, favorite)
+        values = struct.unpack_from(f"<{count}i", current, indices)
+        selected = _blueprint_target(current, slot.digest)
+        if target is not None and target != selected:
+            raise ValueError("蓝图目标已变化，请重新确认。")
+        if selected.replaces_history and target != selected:
+            raise ValueError("覆盖历史蓝图前必须确认目标。")
+        selected_index = selected.slot_index
+        next_index = (selected.history_index if selected.replaces_history
+                      else max(values, default=-1) + 1)
+        modified = bytearray(current)
+        struct.pack_into("<i", modified, indices + 4 * selected_index, next_index)
+        struct.pack_into("<I", modified, favorite, flags | (1 << selected_index))
+        start = blobs + selected_index * 6692 + 4
+        modified[start:start + 6688] = payload[:6688]
+        modified[cameras + 12 * selected_index:cameras + 12 * (selected_index + 1)] = payload[6688:6700]
+        modified[targets + 12 * selected_index:targets + 12 * (selected_index + 1)] = payload[6700:6712]
+        result = _commit_save_edit(
+            slot, directory, progress, current, modified, backup_root,
+            lambda data: data == bytes(modified) and _blueprint_layout(data) == layout,
+        )
+        result["index"] = selected_index
+        result["replaced_history_index"] = selected.history_index
         return result
 
 
