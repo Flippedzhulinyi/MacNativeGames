@@ -24,3 +24,6 @@ int totk_vpool_fini(pool_t *pool);
 int totk_vpool_map(pool_t *virtual_pool, int count, const totk_mapping_request *requests);
 // TOTK diagnostics: CPU address of the physical backing of a virtual-pool range (1 = mapped, *cpu set).
 int totk_vpool_backing(uintptr_t va, uint64_t len, uintptr_t *cpu);
+// Diagnostic snapshot only: 1 = known overlap, 0 = unknown, -1 = invalid input.
+// The mapping table may be incomplete and mappings may change after the call.
+int totk_vpool_known_overlap(uintptr_t a, uint64_t an, uintptr_t b, uint64_t bn);

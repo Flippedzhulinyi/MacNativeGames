@@ -23,8 +23,9 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def module_table(work, version, name):
-    pinned = versions.expected(version)
+def module_table(work, version, name, pinned=None):
+    if pinned is None:
+        pinned = versions.expected(version)
     path = work / f'rewritten/{version}/{name}.patched.bin'
     file = path.read_bytes()
     digest = hashlib.sha256(file).hexdigest()
@@ -105,8 +106,8 @@ def ctor_flag(image, tags, layout, name):
     raise ValueError(f'{name}: no constructor-state load in DT_INIT')
 
 
-def runtime_tables(work, version, out):
-    modules = [module_table(work, version, n) for n in ['main', 'subsdk0', 'sdk']]
+def runtime_tables(work, version, out, pinned=None):
+    modules = [module_table(work, version, n, pinned) for n in ['main', 'subsdk0', 'sdk']]
     main = modules[0]
     target = '_ZN2nn2os13GetSystemTickEv'
     slot = next(r['where'] for r in main['relocs'] if main['symbols'][r['symbol']]['name'] == target and r['kind'] == 1026)
@@ -143,8 +144,9 @@ def runtime_tables(work, version, out):
     return dict(modules=len(modules), relocations=sum(len(m['relocs']) for m in modules), main_plt=hex(plt[0]))
 
 
-def romfs_config(work, version, out):
-    pinned = versions.expected(version)
+def romfs_config(work, version, out, pinned=None):
+    if pinned is None:
+        pinned = versions.expected(version)
     folder = work / f'extracted/{version}/romfs'
     manifest = json.loads((folder / 'index.json').read_text())
     assert manifest['status'] == 'pass' and manifest['romfs_sha256'] == pinned['romfs']['sha256']

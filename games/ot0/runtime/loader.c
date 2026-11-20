@@ -430,6 +430,18 @@ static void abort_report(int num) {
 }
 int main(int argc,char **argv) {
  need(argc==3,"usage: totk-native rewritten-dir probe|boot");
+#if defined(HOGWARTS_EXPERIMENTAL)
+ const char *dry=getenv("HOGWARTS_SKIP_INDIRECT_DRY_RUN");
+ const char *dry_stages=getenv("HOGWARTS_SKIP_UNSUPPORTED_STAGES_DRY_RUN");
+ const char *geometry_capture=getenv("HOGWARTS_GEOMETRY_CAPTURE");
+ if(geometry_capture)need(geometry_capture[0]=='/'&&dry_stages&&!strcmp(dry_stages,"1"),
+                          "Hogwarts geometry capture requires an absolute path and unsupported-stage dry run");
+ if((dry&&!strcmp(dry,"1"))||(dry_stages&&!strcmp(dry_stages,"1"))) {
+  const char *no_commit=getenv("TOTK_GPU_NOCOMMIT");
+  need(no_commit&&!strcmp(no_commit,"1"),"Hogwarts dry run requires TOTK_GPU_NOCOMMIT=1");
+  fprintf(stderr,"[hogwarts] dry run: GPU submission disabled; affected draws will be skipped, output and gameplay are invalid\n");
+ }
+#endif
  /* One game or GPU probe at a time (memory, GPU time): wait for the slot before anything is loaded. */
  if(!strcmp(argv[2],"boot")||!strncmp(argv[2],"probe-gpu",9))runtime_game_slot_acquire(argv[2]);
  if(strcmp(argv[2],"boot"))setenv("TOTK_PROBE_GPU","1",1);   /* standalone probes submit GPU work; the game does not unless TOTK_GPU_ALLOW_SUBMIT=1 */

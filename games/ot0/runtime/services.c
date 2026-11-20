@@ -314,6 +314,17 @@ void *runtime_observer(const char *name) {
  for(size_t i=0;i<sizeof(entries)/sizeof(entries[0]);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
 }
 void *runtime_override(const char *name) {
+#if defined(HOGWARTS_EXPERIMENTAL)
+ extern void *runtime_hogwarts_ro_override(const char *);
+ extern void *runtime_hogwarts_account_override(const char *);
+ extern void *runtime_hogwarts_shop_override(const char *);
+ void *ro = runtime_hogwarts_ro_override(name);
+ if (ro) return ro;
+ void *hogwarts_account = runtime_hogwarts_account_override(name);
+ if (hogwarts_account) return hogwarts_account;
+ void *hogwarts_shop = runtime_hogwarts_shop_override(name);
+ if (hogwarts_shop) return hogwarts_shop;
+#endif
  static const struct {const char *name;void *fn;} entries[]={
   {"_ZN2nn2oe18GetDesiredLanguageEv",runtime_desired_language},
   {"_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi",performance_config},

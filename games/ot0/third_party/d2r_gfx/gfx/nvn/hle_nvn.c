@@ -354,8 +354,10 @@ static void size_chain(int w, int h) {
 NVN(nvnTextureBuilderSetSize3D, void, NVNtextureBuilder *b, int w, int h, int d) { TB(b)->d.width=w;TB(b)->d.height=h;TB(b)->d.depth=d; }
 NVN(nvnTextureBuilderSetLevels, void, NVNtextureBuilder *b, int v) { TB(b)->d.levels = v; }
 NVN(nvnTextureBuilderSetFormat, void, NVNtextureBuilder *b, NVNformat f) { TB(b)->d.format = f; }
-// This adapter currently samples the depth plane; stencil-only sampling stops.
-NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b,NVNtextureDepthStencilMode mode){(void)b;if(mode!=NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH)die("stencil-plane texture sampling is not implemented");}
+NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b,NVNtextureDepthStencilMode mode){
+    if (mode != NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH && mode != NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL) die("invalid NVN depth/stencil mode %d", (int)mode);
+    TB(b)->stencil_mode = mode == NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL;
+}
 NVN(nvnTextureBuilderSetSwizzle, void, NVNtextureBuilder *b,NVNtextureSwizzle r,NVNtextureSwizzle g,NVNtextureSwizzle blue,NVNtextureSwizzle a){if((unsigned)r>5||(unsigned)g>5||(unsigned)blue>5||(unsigned)a>5)die("invalid NVN texture swizzle");TB(b)->d.swizzle_r=r;TB(b)->d.swizzle_g=g;TB(b)->d.swizzle_b=blue;TB(b)->d.swizzle_a=a;}
 NVN(nvnTextureBuilderSetSamples, void, NVNtextureBuilder *b, int s) { TB(b)->d.samples = s; }
 NVN(nvnTextureBuilderSetStride, void, NVNtextureBuilder *b, ptrdiff_t s) { TB(b)->d.stride = (uint32_t)s; }
@@ -408,7 +410,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     }
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
-    o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8);
+    o->has_layout = s->has_layout; o->stencil_mode = s->stencil_mode; memcpy(o->layout, s->layout, 8);
     nvn_tex_layout(&o->d, &o->L);
     o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
     if (s->pkg_data) {
@@ -459,7 +461,7 @@ NVN(nvnTextureGetDepth, int, const NVNtexture *t) { return (int)CTX(t)->d.depth;
 NVN(nvnTextureGetStorageSize, int, const NVNtexture *t) { return (int)CTX(t)->L.size; }
 NVN(nvnTextureCompare, NVNboolean, const NVNtexture *a, const NVNtexture *b) {
     const tex_t *x = CTX(a), *y = CTX(b);
-    return !memcmp(&x->d, &y->d, sizeof x->d) && x->mem == y->mem;
+    return !memcmp(&x->d, &y->d, sizeof x->d) && x->mem == y->mem && x->stencil_mode == y->stencil_mode;
 }
 // 头文件无原型；main 0x174899c 一类调用点把返回值与 1 比，不等则置某状态位 0x100。含义未核，先给 1
 // No prototype in the header; call sites such as main 0x174899c compare the return value with 1 and set some status bit 0x100 if not equal. Meaning unverified; return 1 for now

@@ -82,7 +82,22 @@ void runtime_warm_progress(uint64_t done,uint64_t total,uint64_t shaders,uint64_
 }
 void runtime_warm_done(void){
  atomic_store(&warmPending,0);
- dispatch_async(dispatch_get_main_queue(), ^{if(atomic_load(&presentedFrames))bootOverlay.hidden=YES;});
+#if defined(HOGWARTS_EXPERIMENTAL)
+ const char *noCommit=getenv("TOTK_GPU_NOCOMMIT"),*allow=getenv("TOTK_GPU_ALLOW_SUBMIT"),*probe=getenv("TOTK_PROBE_GPU");
+ int disabled=(noCommit&&!strcmp(noCommit,"1"))||!((allow&&!strcmp(allow,"1"))||(probe&&!strcmp(probe,"1")));
+ fprintf(stderr,"[hogwarts] shader warm-up finished; GPU submission %s\n",disabled?"disabled":"enabled");
+#endif
+ dispatch_async(dispatch_get_main_queue(), ^{
+  if(atomic_load(&presentedFrames)){bootOverlay.hidden=YES;return;}
+#if defined(HOGWARTS_EXPERIMENTAL)
+  if(bootOverlay&&!bootOverlay.hidden){
+   bootStage.stringValue=@"着色器预热已结束";
+   bootDetail.stringValue=disabled?@"诊断模式已禁用 GPU 提交，无游戏画面；部分着色器可能失败，详见日志":
+                                    @"等待首个画面；部分着色器可能失败，详见日志";
+   [bootProgress stopAnimation:nil];bootProgress.hidden=YES;
+  }
+#endif
+ });
 }
 uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
 /* TOTK_ASSUME_FOCUS=1: unattended test runs. macOS refuses to activate an app launched from the background while the user is working in
@@ -213,7 +228,11 @@ void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(),
 static void front_install_menu(void){
  NSMenu *menu=[NSMenu new],*appMenu=[NSMenu new];
  NSMenuItem *appItem=[NSMenuItem new];appItem.submenu=appMenu;[menu addItem:appItem];
+#if defined(HOGWARTS_EXPERIMENTAL)
+ NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@"退出霍格沃茨诊断测试" action:@selector(performClose:) keyEquivalent:@"q"];
+#else
  NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@(TOTK_UI("退出 Octopath Traveler 0","Quit Octopath Traveler 0")) action:@selector(performClose:) keyEquivalent:@"q"];
+#endif
  quit.keyEquivalentModifierMask=NSEventModifierFlagCommand;quit.target=window;
  [appMenu addItem:quit];NSApp.mainMenu=menu;
 }
@@ -235,7 +254,12 @@ void runtime_front_run(void(*callback)(void)){
   window.releasedWhenClosed=NO;   /* a close that waits for a save (windowWillClose) must not free the window the static pointer still holds */
   /* An agent's test game (TOTK_SLOT_OWNER other than user) says so in its title: it plays a save copy and its script closes it. */
   const char *owner=getenv("TOTK_SLOT_OWNER"),*purpose=getenv("TOTK_SLOT_PURPOSE");
+#if defined(HOGWARTS_EXPERIMENTAL)
+  (void)owner; (void)purpose;
+  window.title=@"霍格沃茨诊断测试 — 不可游玩 / GPU 提交已禁用";
+#else
   window.title=owner&&*owner&&strcmp(owner,"user")?[NSString stringWithFormat:@(TOTK_UI("测试局（%s）Ver. %s：%s — 存档副本，进度不会存进你的存档，脚本会自己关闭","Test session (%s) Ver. %s: %s — save copy, progress is not saved to your save, the script closes it")),owner,TOTK_GAME_VERSION,purpose&&*purpose?purpose:TOTK_UI("代理测试","agent test")]:[NSString stringWithFormat:@"Octopath Traveler 0 — Ver. %s",TOTK_GAME_VERSION];
+#endif
   windowDelegate=[TOTKWindowDelegate new];window.delegate=windowDelegate;
   front_install_menu();
   window.collectionBehavior|=NSWindowCollectionBehaviorFullScreenPrimary;
@@ -244,7 +268,11 @@ void runtime_front_run(void(*callback)(void)){
   metalLayer.framebufferOnly=NO;window.contentView.wantsLayer=YES;window.contentView.layer=metalLayer;
   bootOverlay=[[NSView alloc] initWithFrame:window.contentView.bounds];bootOverlay.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
   bootOverlay.wantsLayer=YES;bootOverlay.layer.backgroundColor=[NSColor colorWithCalibratedRed:0.035 green:0.075 blue:0.09 alpha:1].CGColor;
+#if defined(HOGWARTS_EXPERIMENTAL)
+  bootStage=[NSTextField labelWithString:@"诊断模式：不可游玩，无有效画面"];
+#else
   bootStage=[NSTextField labelWithString:@(TOTK_UI("正在启动 Octopath Traveler 0","Starting Octopath Traveler 0"))];
+#endif
   bootStage.font=[NSFont systemFontOfSize:25 weight:NSFontWeightSemibold];bootStage.textColor=NSColor.whiteColor;
   bootStage.alignment=NSTextAlignmentCenter;bootStage.frame=NSMakeRect(0,wh/2+20,ww,40);bootStage.autoresizingMask=NSViewWidthSizable|NSViewMinYMargin|NSViewMaxYMargin;
   bootDetail=[NSTextField labelWithString:@(TOTK_UI("正在准备游戏环境","Preparing the game environment"))];

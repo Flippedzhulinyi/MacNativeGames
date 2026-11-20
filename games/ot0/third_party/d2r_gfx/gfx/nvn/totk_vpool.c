@@ -11,6 +11,7 @@
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
 #include <pthread.h>
+#include <string.h>
 #include <unistd.h>
 
 #define F_CPU_NO_ACCESS NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS
@@ -20,6 +21,7 @@
 #define POOL_MAGIC MAGIC('P', 'O', 'O', 'L')
 
 static pthread_mutex_t g_map_mu = PTHREAD_MUTEX_INITIALIZER;
+static void vmap_forget_pool(const pool_t *o);
 
 static uint64_t host_page(void) { return (uint64_t)getpagesize(); }
 static uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
@@ -50,10 +52,15 @@ int totk_vpool_init(pool_t *o) {
 }
 
 int totk_vpool_fini(pool_t *o) {
-    if (!o->host) return 0;
-    mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)o->host, o->span);
-    o->host = NULL; o->mem = o->game_mem; o->span = 0;
-    return 1;
+    pthread_mutex_lock(&g_map_mu);
+    vmap_forget_pool(o);
+    int released = o->host != NULL;
+    if (released) {
+        mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)(uintptr_t)o->host, o->span);
+        o->host = NULL; o->mem = o->game_mem; o->span = 0;
+    }
+    pthread_mutex_unlock(&g_map_mu);
+    return released;
 }
 
 static int check_request(const pool_t *v, const totk_mapping_request *r, int i) {
@@ -73,14 +80,80 @@ static int check_request(const pool_t *v, const totk_mapping_request *r, int i) 
 // address can protect the pages the CPU actually touches (the game reads/writes physical pools through their own view).
 typedef struct { uintptr_t va, cpu; uint64_t size; } vmap_ent;
 static vmap_ent g_vmap[512]; static int g_nvmap;
+static int vmap_overlap(uintptr_t a, uint64_t an, uintptr_t b, uint64_t bn) {
+    return a <= b ? b - a < an : a - b < bn;
+}
+static void vmap_forget_pool(const pool_t *o) {
+    if (!o->mem || !o->size) return;
+    uintptr_t base = (uintptr_t)o->mem;
+    for (int i = 0; i < g_nvmap;) {
+        vmap_ent e = g_vmap[i];
+        if (vmap_overlap(e.va, e.size, base, o->size) ||
+            vmap_overlap(e.cpu, e.size, base, o->size))
+            g_vmap[i] = g_vmap[--g_nvmap];
+        else i++;
+    }
+}
 static void vmap_note(uintptr_t va, uint64_t size, uintptr_t cpu) {
-    for (int i = 0; i < g_nvmap; i++) if (g_vmap[i].va == va) { g_vmap[i] = (vmap_ent){va, cpu, size}; return; }
-    if (g_nvmap < 512) g_vmap[g_nvmap++] = (vmap_ent){va, cpu, size};
+    vmap_ent kept[512]; int n = 0, truncated = 0;
+    uintptr_t end = va + size;
+    for (int i = 0; i < g_nvmap; i++) {
+        vmap_ent e = g_vmap[i];
+        uintptr_t eend = e.va + e.size;
+        if (!vmap_overlap(e.va, e.size, va, size)) {
+            if (n < 512) kept[n++] = e;
+            else truncated = 1;
+            continue;
+        }
+        if (e.va < va) {
+            if (n < 512) kept[n++] = (vmap_ent){e.va, e.cpu, va - e.va};
+            else truncated = 1;
+        }
+        if (eend > end) {
+            if (n < 512) kept[n++] = (vmap_ent){end, e.cpu + (end - e.va), eend - end};
+            else truncated = 1;
+        }
+    }
+    if (cpu) {
+        if (n < 512) kept[n++] = (vmap_ent){va, cpu, size};
+        else truncated = 1;
+    }
+    memcpy(g_vmap, kept, (size_t)n * sizeof *kept);
+    g_nvmap = n;
+    if (truncated) LOG("【红】vpool: diagnostic mapping table full; some backing ranges unavailable");
 }
 int totk_vpool_backing(uintptr_t va, uint64_t len, uintptr_t *cpu) {
+    if (!cpu || !len || len > UINTPTR_MAX - va) return 0;
     pthread_mutex_lock(&g_map_mu); int r = 0;
-    for (int i = 0; i < g_nvmap; i++) { const vmap_ent *e = &g_vmap[i]; if (e->cpu && va >= e->va && va + len <= e->va + e->size) { *cpu = e->cpu + (va - e->va); r = 1; break; } }
+    for (int i = 0; i < g_nvmap; i++) { const vmap_ent *e = &g_vmap[i]; if (va >= e->va && va - e->va < e->size && len <= e->size - (va - e->va)) { *cpu = e->cpu + (va - e->va); r = 1; break; } }
     pthread_mutex_unlock(&g_map_mu); return r;
+}
+typedef struct { uintptr_t start; uint64_t size; } vmap_range;
+static int vmap_fragments(uintptr_t start, uint64_t size, vmap_range *out) {
+    int n = 0;
+    uintptr_t end = start + size;
+    out[n++] = (vmap_range){start, size};
+    for (int i = 0; i < g_nvmap; i++) {
+        vmap_ent e = g_vmap[i];
+        uintptr_t lo = start > e.va ? start : e.va;
+        uintptr_t hi = end < e.va + e.size ? end : e.va + e.size;
+        if (lo < hi) out[n++] = (vmap_range){e.cpu + (lo - e.va), hi - lo};
+    }
+    return n;
+}
+int totk_vpool_known_overlap(uintptr_t a, uint64_t an, uintptr_t b, uint64_t bn) {
+    if (!a || !b || !an || !bn || an > UINTPTR_MAX - a || bn > UINTPTR_MAX - b) return -1;
+    vmap_range left[513], right[513];
+    pthread_mutex_lock(&g_map_mu);
+    int nl = vmap_fragments(a, an, left), nr = vmap_fragments(b, bn, right), overlap = 0;
+    for (int i = 0; i < nl && !overlap; i++)
+        for (int j = 0; j < nr; j++)
+            if (vmap_overlap(left[i].start, left[i].size, right[j].start, right[j].size)) {
+                overlap = 1;
+                break;
+            }
+    pthread_mutex_unlock(&g_map_mu);
+    return overlap;
 }
 static int apply_request(pool_t *v, const totk_mapping_request *r) {
     mach_vm_address_t dst = (mach_vm_address_t)(uintptr_t)(v->mem + r->virtual_offset);

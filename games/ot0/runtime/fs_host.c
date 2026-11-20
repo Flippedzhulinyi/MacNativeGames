@@ -136,6 +136,14 @@ static unsigned char save_exists(uint64_t application, const uint64_t *uid) {
     ready(); uint64_t me[2]; runtime_account_uid(me);
     return application == TOTK_APPLICATION_ID && uid && uid[0] == me[0] && uid[1] == me[1];
 }
+#if defined(HOGWARTS_EXPERIMENTAL)
+static unsigned char own_save_exists(const uint64_t *uid) { return save_exists(TOTK_APPLICATION_ID, uid); }
+static unsigned own_save_exists_out(unsigned char *exists, const uint64_t *uid) {
+    if (!exists) return R_INVALID_ARGUMENT;
+    *exists = own_save_exists(uid);
+    return 0;
+}
+#endif
 /* Other titles' save data (e.g. data-link bonuses) is not present on this host. */
 static unsigned mount_save_ro(const char *name, uint64_t application, const uint64_t *uid) {
     if (!save_exists(application, uid)) return R_TARGET_NOT_FOUND;
@@ -457,6 +465,10 @@ void *runtime_fs_host_override(const char *name) {
         {"_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", mount_save},
         {"_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", mount_save_ro},
         {"_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", save_exists},
+#if defined(HOGWARTS_EXPERIMENTAL)
+        {"_ZN2nn2fs18IsSaveDataExistingERKNS_7account3UidE", own_save_exists},
+        {"_ZN2nn2fs18IsSaveDataExistingEPbRKNS_7account3UidE", own_save_exists_out},
+#endif
         {"_ZN2nn2fs21MountTemporaryStorageEPKc", mount_temp}, {"_ZN2nn2fs7UnmountEPKc", unmount}, {"_ZN2nn2fs6CommitEPKc", commit},
         {"_ZN2nn2fs14CommitSaveDataEPKc", commit}, {"_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", ensure_save},   /* Bayonetta 3 */
         {"_ZN2nn2fs18CreateCacheStorageEill", create_cache}, {"_ZN2nn2fs18DeleteCacheStorageEi", delete_cache},

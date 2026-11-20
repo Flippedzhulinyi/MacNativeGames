@@ -1,0 +1,34 @@
+{
+  "description": "Locally observed update ExeFS; not an authenticity or version certification",
+  "files": {
+    "main": {
+      "size": 72799277,
+      "sha256": "99936098293823c1e43705fcaa82a59acc1aa23c98dcb12d081537ac0670f680"
+    },
+    "main.npdm": {
+      "size": 1604,
+      "sha256": "a370c4856e573b3674813e9492ef2e6134a50cc5ad41cb67f117bc6091c3ce40"
+    },
+    "rtld": {
+      "size": 7952,
+      "sha256": "70d47e8ffa857b93ba69fcec3eee294b0bc5c32065a18c455c8eaf74a336acbd"
+    },
+    "sdk": {
+      "size": 6217525,
+      "sha256": "2725e0520d65ce984e709131782d7047250c127b09142f5ea3b8dde4c03dc4ce"
+    },
+    "subsdk0": {
+      "size": 3436212,
+      "sha256": "c3444d8b64271c16e31f4a3149e4162c861de40e39affc60448b448fff51e080"
+    }
+  },
+  "rewritten_sha256": {
+    "main.patched.bin": "4c16b5b22e27113cb872ea6469826d724393c64325efbf3ff3d87904933e3c5a",
+    "sdk.patched.bin": "b06ba4131c28f19dfd9b2f15f469be4b70a9a5cd103cd35798c7d7a42877642f",
+    "subsdk0.patched.bin": "26989436db6fe1ea9ac118cb66bbaa23a0f08cb7ff9e25d77606f5329d3be4c3"
+  },
+  "romfs": {
+    "size": 13892667704,
+    "sha256": "5e9f17f023e4aa9e46bd35b3a0d3780346830fb484ccbc9eca20028c52aedc8a"
+  }
+}

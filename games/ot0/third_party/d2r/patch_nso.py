@@ -25,6 +25,7 @@ from itertools import combinations
 import lz4.block
 from capstone import *
 from call_window import BLR_X18, BLR_X30, prepare_call
+from patch_layout import patch_layout
 from relr import decode_relr
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -43,13 +44,7 @@ TEXT_END = segs[0][2]
 RO_OFF, DATA_OFF = segs[1][1], segs[2][1]
 KEY_PAGE_OFF = (len(IMG) + 0x3FFF) & ~0x3FFF
 IMG.extend(bytes(0x4000))
-PATCH_OFF = (len(IMG) + 0xFFFF) & ~0xFFFF
-BRANCH_REACH = 1 << 27
-PATCH_RESERVE = 0x2000000
-IMAGE_FILE_OFF = 0
-if PATCH_OFF + PATCH_RESERVE > BRANCH_REACH:
-    assert TEXT_END + PATCH_RESERVE <= BRANCH_REACH, 'text too large for a patch area on either side of the module'
-    PATCH_OFF, IMAGE_FILE_OFF = -PATCH_RESERVE, PATCH_RESERVE
+PATCH_OFF, IMAGE_FILE_OFF, PATCH_RESERVE = patch_layout(len(IMG), TEXT_END)
 
 # ---- 已登记剪口：{NSO 构建号: [(偏移, 原字节, 新字节, 理由)]} ----
 # 联网剪口（排除范围：战网 / 联机）：取自社区离线修复（LFS Mod Offline Fix for v2228224，与官方 94012 main 只差这 7 个字）。
@@ -1132,7 +1127,8 @@ else:
     open(P('patched.bin'), 'wb').write(IMG + bytearray(PATCH_OFF - len(IMG)) + patch)
 import hashlib
 with open(os.path.join(outdir, 'build_src.sha256'), 'w') as f:
-    f.write(hashlib.sha256(open(os.path.abspath(__file__), 'rb').read()).hexdigest() + '  patch_nso.py\n')
+    for source in (os.path.abspath(__file__), os.path.join(os.path.dirname(__file__), 'patch_layout.py')):
+        f.write(hashlib.sha256(open(source, 'rb').read()).hexdigest() + f'  {os.path.basename(source)}\n')
 if PRIVATE_AIM:
     with open(P('aim.tsv'), 'w') as f:
         f.write('# RULESET\tskill-aim-v1-private\n# ORIGINAL_CALL\t0x2faf04\t97fee7fd\n# ORIGINAL_CALLEE\t0x2b4ef8\n# SKILL_CALLER\t0x2b5b80\n# SVC\t0x86\n# INPUT\tactual GetNpad sampled right; move axis unchanged\n')

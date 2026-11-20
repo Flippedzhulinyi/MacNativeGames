@@ -66,6 +66,12 @@ static void bsd_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     case 2: case 3:                                                               /* Socket / SocketExempt */
         fprintf(stderr, "[totk-net] socket(%u, %u, %u) refused: offline\n", IPC_ARG(rq, uint32_t, 0), IPC_ARG(rq, uint32_t, 4), IPC_ARG(rq, uint32_t, 8));
         bsd_result(rs, -1, BSD_ENETDOWN); return;
+#if defined(HOGWARTS_EXPERIMENTAL)
+    case 6: {
+        extern void runtime_hogwarts_bsd_poll(const IpcRequest *, IpcResponse *);
+        runtime_hogwarts_bsd_poll(rq, rs); return;
+    }
+#endif
     default: ipc_unimplemented(s, rq);
     }
 }

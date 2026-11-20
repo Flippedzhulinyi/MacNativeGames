@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(HOGWARTS_EXPERIMENTAL)
+void runtime_game_patches(Module *main_module) { (void)main_module; }
+#else
 /* Bayonetta 3: the player's 1.2.0 exefs patches (60 fps, 900p, LOD, film grain), applied to main after relocation and
    before its text is sealed. scripts/prepare_patches.py turns each .pchtxt into patches/<version>/<slug>.tsv ("offset new orig",
    hex), already checked against the original image and the rewrite; here every site is checked again against the loaded
@@ -61,6 +64,7 @@ void runtime_game_patches(Module *main_module) {
         apply_file(main_module, s);
     }
 }
+#endif
 
 /* The TotK host hooks the shared graphics layer and the input keys call keep their names and answer "off". */
 void runtime_frame_step_pin(double ms) { (void)ms; }

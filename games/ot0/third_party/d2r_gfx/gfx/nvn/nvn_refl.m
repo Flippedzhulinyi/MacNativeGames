@@ -1,6 +1,7 @@
 // 着色器反射 json（B：Switch 原版翻译，tools/dmsh_build.py 出）→ 定长 C 数组（nvn_refl.h）
 // Shader reflection json (B: produced by translating the original Switch shaders, output of tools/dmsh_build.py) → fixed-length C arrays (nvn_refl.h)
 #import "nvn_refl.h"
+#include "nvn_indirect_texture.h"
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
@@ -29,7 +30,8 @@ static int refl_rw(NSDictionary *b) {
     NSString *t = b[@"msl_type"]; if (![t isKindOfClass:[NSString class]]) return 0;
     return [t containsString:@"access::write"] || [t containsString:@"access::read_write"];
 }
-int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
+static int refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen, int scalar_diagnostic) {
+    (void)scalar_diagnostic;
     memset(o, 0, sizeof *o);
     #define FAIL(...) do { snprintf(err, errlen, __VA_ARGS__); return 1; } while (0)
     if (![j[@"route"] isEqual:@"B"]) FAIL("不是 B 反射（route ≠ B；A 路线 / PC 链反射已退役）");
@@ -37,12 +39,80 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
         NSArray *bs = j[@"bindings"];
         if (![bs isKindOfClass:[NSArray class]]) FAIL("缺 bindings");
         if (bs.count > NVN_REFL_MAXB) FAIL("绑定 %lu 个，超上限 %d", (unsigned long)bs.count, NVN_REFL_MAXB);
+        int has_indirect = 0;
         o->route_b = 1; o->abi = 0;   // spirv-cross 第 0 组 → [[buffer(0)]] | spirv-cross set 0 → [[buffer(0)]]
         for (NSDictionary *b in bs) {
             NSString *k = b[@"kind"]; nvn_rbind *r = &o->b[o->nb];
             id rg = b[@"reg"]; int reg = [rg isKindOfClass:[NSNumber class]] ? [rg intValue] : -1, aid = [b[@"arg_id"] intValue];
             r->aid = (uint16_t)aid; r->reg = reg < 0 ? 0 : (uint16_t)reg;
-            if ([k isEqualToString:@"cbuf"]) r->kind = NVN_RB_CBUF;
+            NSString *name = b[@"msl_name"], *type = b[@"msl_type"];
+            nvn_indirect_texture indirect;
+#ifdef HOGWARTS_EXPERIMENTAL
+            nvn_indirect_single_texture single;
+            nvn_indirect_single_sampler single_sampler;
+#endif
+            int is_indirect = [name isKindOfClass:[NSString class]] && [type isKindOfClass:[NSString class]] &&
+                nvn_indirect_texture_decode(name.UTF8String, type.UTF8String, &indirect);
+#ifdef HOGWARTS_EXPERIMENTAL
+            int cube_indirect = scalar_diagnostic && [name isKindOfClass:[NSString class]] &&
+                [type isKindOfClass:[NSString class]] &&
+                nvn_indirect_cube_decode(name.UTF8String, type.UTF8String, &indirect);
+            int array_2d_indirect = scalar_diagnostic && [name isKindOfClass:[NSString class]] &&
+                [type isKindOfClass:[NSString class]] &&
+                nvn_indirect_2d_decode(name.UTF8String, type.UTF8String, &indirect);
+            is_indirect |= cube_indirect || array_2d_indirect;
+#endif
+            if (is_indirect) {
+                if (![k isEqualToString:indirect.sampler ? @"samp" : @"tex"] ||
+                    (rg && rg != [NSNull null] && ![rg isKindOfClass:[NSNumber class]]) ||
+                    ([rg isKindOfClass:[NSNumber class]] &&
+                     ([rg doubleValue] != (double)reg || reg < 0 ||
+                      !indirect.sampler || reg != indirect.sampler_slot)))
+                    FAIL("indirect texture array: inconsistent kind or register");
+                r->kind = indirect.sampler ? NVN_RB_ISAMP : NVN_RB_ITEX;
+                r->reg = indirect.uniform_slot; r->off = indirect.sampler_slot;
+                r->indirect_count = (uint8_t)indirect.count;
+#ifdef HOGWARTS_EXPERIMENTAL
+                if (cube_indirect) r->ptr = 3;
+                if (array_2d_indirect) r->ptr = 4;
+#endif
+                has_indirect = 1;
+            }
+            else if ([name isKindOfClass:[NSString class]] && [type isKindOfClass:[NSString class]] &&
+                     [name containsString:@"_t3d_cb"] && [type hasPrefix:@"array<"])
+                FAIL("indirect texture array: unsupported name or type");
+#ifdef HOGWARTS_EXPERIMENTAL
+            else if ([type isKindOfClass:[NSString class]] &&
+                     ([type hasPrefix:@"array<texture"] || [type hasPrefix:@"array<depth"] ||
+                      [type hasPrefix:@"array<sampler"]))
+                FAIL("texture or sampler array: unsupported name or type");
+            else if ([name isKindOfClass:[NSString class]] && [type isKindOfClass:[NSString class]] &&
+                     nvn_indirect_single_texture_decode(name.UTF8String, type.UTF8String, &single)) {
+                if (!scalar_diagnostic) FAIL("indirect uniform texture: replay unsupported");
+                if (![k isEqualToString:single.sampler ? @"samp" : @"tex"] ||
+                    (single.sampler ? ![rg isKindOfClass:[NSNumber class]] ||
+                        [rg doubleValue] != single.sampler_slot :
+                        (rg && rg != [NSNull null])))
+                    FAIL("indirect uniform texture: inconsistent kind or register");
+                r->kind = single.sampler ? NVN_RB_SCALAR_ISAMP : NVN_RB_SCALAR_ITEX;
+                r->reg = single.uniform_slot; r->off = single.uniform_byte_offset;
+                r->indirect_count = (uint8_t)single.sampler_slot; r->ptr = 1;
+                has_indirect = 1;
+            }
+            else if ([name isKindOfClass:[NSString class]] && [type isKindOfClass:[NSString class]] &&
+                     nvn_indirect_single_sampler_decode(name.UTF8String, type.UTF8String, &single_sampler)) {
+                if (!scalar_diagnostic) FAIL("indirect uniform sampler: replay unsupported");
+                if (![k isEqualToString:single_sampler.sampler ? @"samp" : @"tex"] ||
+                    (single_sampler.sampler ? rg && rg != [NSNull null] :
+                        ![rg isKindOfClass:[NSNumber class]] || [rg doubleValue] != single_sampler.reflected_texture_slot))
+                    FAIL("indirect uniform sampler: inconsistent kind or register");
+                r->kind = single_sampler.sampler ? NVN_RB_SCALAR_ISAMP : NVN_RB_SCALAR_ITEX;
+                r->reg = single_sampler.uniform_slot; r->off = single_sampler.uniform_byte_offset;
+                r->indirect_count = (uint8_t)single_sampler.sampler_slot; r->ptr = 2;
+                has_indirect = 1;
+            }
+#endif
+            else if ([k isEqualToString:@"cbuf"]) r->kind = NVN_RB_CBUF;
             else if ([k isEqualToString:@"samp"]) r->kind = NVN_RB_SAMP;
             else if ([k isEqualToString:@"samp_tex"]) r->kind = NVN_RB_SAMPT;
             else if ([k isEqualToString:@"tex"]) { r->kind = NVN_RB_TEX; dummy_kind(b[@"msl_type"], &r->dtt, &r->dpf); }
@@ -60,9 +130,47 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             else if ([k isEqualToString:@"drvcb"]) r->kind = [b[@"bank"] intValue] == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
             else FAIL("B 绑定种类 %s 未实现（%s）", k.UTF8String, [b[@"msl_name"] UTF8String]);
             { NSString *nm = b[@"msl_name"]; if ([nm isKindOfClass:[NSString class]] && [nm containsString:@"_cb0_"] && [nm containsString:@"["]) r->arr = 1; }
-            if ((r->kind == NVN_RB_CBUF || r->kind == NVN_RB_SAMP || r->kind == NVN_RB_SAMPT || r->kind == NVN_RB_TEX || r->kind == NVN_RB_IMG || r->kind == NVN_RB_TBUF || r->kind == NVN_RB_SBUFP || r->kind == NVN_RB_UBOP || r->kind == NVN_RB_SBUFU) && reg < 0)
-                FAIL("B 绑定 %s 没解出槽号", [b[@"msl_name"] UTF8String]);
+            if ((r->kind == NVN_RB_CBUF || r->kind == NVN_RB_SAMP || r->kind == NVN_RB_SAMPT || r->kind == NVN_RB_TEX || r->kind == NVN_RB_IMG || r->kind == NVN_RB_TBUF || r->kind == NVN_RB_SBUFP || r->kind == NVN_RB_UBOP || r->kind == NVN_RB_SBUFU) && reg < 0) {
+                FAIL("B 绑定 %s 没解出槽号", [name UTF8String]);
+            }
             o->nb++;
+        }
+        if (has_indirect) {
+            uint8_t occupied[NVN_REFL_MAXB] = {0};
+            for (int i = 0; i < o->nb; i++) {
+                nvn_rbind *r = &o->b[i];
+                id raw_id = bs[(NSUInteger)i][@"arg_id"];
+                int is_array = r->kind == NVN_RB_ITEX || r->kind == NVN_RB_ISAMP;
+                int count = is_array ? r->indirect_count : 1;
+                if (![raw_id isKindOfClass:[NSNumber class]] || [raw_id longLongValue] < 0 ||
+                    [raw_id longLongValue] >= NVN_REFL_MAXB ||
+                    [raw_id doubleValue] != (double)[raw_id longLongValue] ||
+                    count > NVN_REFL_MAXB - (int)[raw_id longLongValue])
+                    FAIL("indirect texture array: argument range invalid");
+                int start = (int)[raw_id longLongValue];
+                for (int n = 0; n < count; n++)
+                    if (occupied[start + n]++) FAIL("indirect texture array: overlapping arguments");
+                if (is_array || r->kind == NVN_RB_SCALAR_ITEX || r->kind == NVN_RB_SCALAR_ISAMP) {
+                    NSString *name = bs[(NSUInteger)i][@"msl_name"];
+                    int is_tex = r->kind == NVN_RB_ITEX || r->kind == NVN_RB_SCALAR_ITEX;
+                    NSString *other = is_tex ? [name stringByAppendingString:@"Smplr"] :
+                        [name substringToIndex:name.length - 5];
+                    int matches = 0;
+                    for (int j = 0; j < o->nb; j++) {
+                        nvn_rbind *q = &o->b[j];
+                        if ([bs[(NSUInteger)j][@"msl_name"] isEqualToString:other] &&
+                            q->kind == (is_array ? (is_tex ? NVN_RB_ISAMP : NVN_RB_ITEX) :
+                                (is_tex ? NVN_RB_SCALAR_ISAMP : NVN_RB_SCALAR_ITEX)) &&
+                            q->reg == r->reg && q->off == r->off && q->indirect_count == r->indirect_count &&
+                            q->ptr == r->ptr && q->arr == r->arr) {
+                            matches++;
+                            r->pair_aid = q->aid;
+                        }
+                    }
+                    if (matches != 1) FAIL("indirect texture array: missing or mismatched pair");
+                }
+            }
+            o->has_indirect_textures = 1;
         }
         o->bindless_slots = [j[@"bindless_slots"] boolValue] ? 1 : 0;
         NSDictionary *dr = j[@"drv_reads"];
@@ -115,3 +223,11 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
     }
     #undef FAIL
 }
+int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
+    return refl_from_json(j, o, err, errlen, 0);
+}
+#ifdef HOGWARTS_EXPERIMENTAL
+int nvn_refl_from_json_scalar_diagnostic(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
+    return refl_from_json(j, o, err, errlen, 1);
+}
+#endif

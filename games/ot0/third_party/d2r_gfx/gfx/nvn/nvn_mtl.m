@@ -36,6 +36,9 @@ static uint64_t g_gen_shown;            // interpolated frames handed to the scr
 #include "nvn_dirty.h"
 #include "nvn_depth_clear.h"
 #include "nvn_refl.h"
+#include "nvn_indirect_texture.h"
+#include "nvn_indirect_hazard.h"
+#include "totk_vpool.h"
 #include "nvn_texture_plan.h"
 #include "fps_overlay.h"
 #include "nvn_cover.h"
@@ -220,11 +223,18 @@ static struct { uint64_t adds, removes, live_bytes; _Atomic uint64_t alive, aliv
 static char g_alloc_track_key;
 static NSMapTable *g_res_site_of;   // resource (weak key) -> NSNumber source line
 static uint64_t g_res_live_bytes;
+@interface NvResidencyPin : NSObject { @public NSUInteger count; BOOL remove_pending; } @end
+@implementation NvResidencyPin @end
+static NSMapTable *g_res_pins;
+static NSHashTable *g_res_recycled;
+static int g_res_recycled_negative;
 static void res_add_at(id<MTLResource> r, int site) {
     if (!r) return;
     if (site < 0 || site >= RES_SITES) site = 0;
     pthread_mutex_lock(&g_res_mu);
     [g_res addAllocation:(id<MTLAllocation>)r];
+    NvResidencyPin *pin = [g_res_pins objectForKey:r];
+    if (pin) pin->remove_pending = NO;
     if (!g_res_objects) { g_res_objects = [NSHashTable weakObjectsHashTable]; g_res_site_of = [NSMapTable weakToStrongObjectsMapTable]; }
     if (![g_res_objects containsObject:r]) {
         uint64_t sz = (uint64_t)r.allocatedSize;
@@ -239,9 +249,7 @@ static void res_add_at(id<MTLResource> r, int site) {
     pthread_mutex_unlock(&g_res_mu);
 }
 #define res_add(r) res_add_at((r), __LINE__)
-static void res_remove_body(id<MTLResource> r) {
-    if (!r) return;
-    pthread_mutex_lock(&g_res_mu);
+static void res_remove_locked(id<MTLResource> r) {
     [g_res removeAllocation:(id<MTLAllocation>)r];
     if ([g_res_objects containsObject:r]) {
         int site = ((NSNumber *)[g_res_site_of objectForKey:r]).intValue; uint64_t sz = (uint64_t)r.allocatedSize;
@@ -250,6 +258,13 @@ static void res_remove_body(id<MTLResource> r) {
         [g_res_objects removeObject:r]; [g_res_site_of removeObjectForKey:r];
     }
     g_res_dirty = 1;
+}
+static void res_remove_body(id<MTLResource> r) {
+    if (!r) return;
+    pthread_mutex_lock(&g_res_mu);
+    NvResidencyPin *pin = [g_res_pins objectForKey:r];
+    if (pin) pin->remove_pending = YES;
+    else res_remove_locked(r);
     pthread_mutex_unlock(&g_res_mu);
 }
 static int g_res_remove_no_pool; // GPU probe negative control only
@@ -262,6 +277,29 @@ static void res_remove(id<MTLResource> r) {
        alive. Drain this call's temporaries; explicit owners, deferred fences and
        residency commit ordering remain responsible for resource lifetime. */
     @autoreleasepool { res_remove_body(r); }
+}
+static int res_pin(id<MTLResource> r) {
+    pthread_mutex_lock(&g_res_mu);
+    NvResidencyPin *pin = [g_res_pins objectForKey:r];
+    if (![g_res_objects containsObject:r] || (!g_res_recycled_negative && [g_res_recycled containsObject:r]) || (pin && pin->remove_pending)) {
+        pthread_mutex_unlock(&g_res_mu); return 0;
+    }
+    if (!g_res_pins) g_res_pins = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality
+                                                        valueOptions:NSPointerFunctionsStrongMemory];
+    if (!pin) { pin = [NvResidencyPin new]; [g_res_pins setObject:pin forKey:r]; }
+    pin->count++;
+    pthread_mutex_unlock(&g_res_mu);
+    return 1;
+}
+static void res_unpin(id<MTLResource> r) {
+    pthread_mutex_lock(&g_res_mu);
+    NvResidencyPin *pin = [g_res_pins objectForKey:r];
+    if (!pin || !pin->count) { pthread_mutex_unlock(&g_res_mu); MDIE("residency pin underflow"); }
+    if (!--pin->count) {
+        if (pin->remove_pending) res_remove_locked(r);
+        [g_res_pins removeObjectForKey:r];
+    }
+    pthread_mutex_unlock(&g_res_mu);
 }
 /* Top registration sites by live resident bytes (caller must not hold g_res_mu). */
 static void res_site_report(int top) {
@@ -1588,6 +1626,36 @@ static uint64_t upd_overlap_seq(uint64_t lo, uint64_t hi) {
     uint64_t last = 0;
     for (int i = a - 1; i >= 0 && g_upd_maxhi[i] > lo; i--) if (g_upd[i].hi > lo && g_upd[i].seq > last) last = g_upd[i].seq;
     return last;
+}
+/* Use only a ready snapshot and subsequent renamed inline updates. GPU writes,
+   earlier pending submissions and fallback copies remain unsafe to read here. */
+static int indirect_uniform_snapshot_at(const p_bind_buf *u, size_t offset, unsigned count, uint32_t sampler,
+                                        nvn_indirect_texture_ids *out) {
+    if (!u || !out || !u->addr || !count || count > 32) return 0;
+    size_t n = (count - 1) * 8u + 4u;
+    if (offset > u->size || n > u->size - offset || u->addr > UINT64_MAX - u->size ||
+        !usnap_on() || g_usnap_drop_off || pend_over()) return 0;
+    const usnap_t *snapshot = usnap_find(u->addr, u->size);
+    if (!snapshot) return 0;
+    uint64_t start_addr = u->addr + offset;
+    uint8_t bytes[31 * 8 + 4];
+    memcpy(bytes, snapshot->cpu + (start_addr - snapshot->lo), n);
+    for (int i = 0; i < g_npend; i++) {
+        uint64_t lo = g_pend_lo[i], hi = g_pend_hi[i];
+        if (hi <= u->addr || lo >= u->addr + u->size) continue;
+        if (i < g_usnap_pend_n || g_pend_fence[i] != g_fence + 1 ||
+            g_pend_kind[i] != 0 || !g_pend_src[i] ||
+            !upd_overlap_seq(lo, hi)) return 0;
+        uint64_t start = lo > start_addr ? lo : start_addr;
+        uint64_t end = hi < start_addr + n ? hi : start_addr + n;
+        if (start < end)
+            memcpy(bytes + (start - start_addr), (const uint8_t *)g_pend_src[i] + (start - lo), end - start);
+    }
+    return nvn_indirect_texture_unpack(bytes, n, count, sampler, out);
+}
+static int indirect_uniform_snapshot(const p_bind_buf *u, unsigned count, uint32_t sampler,
+                                     nvn_indirect_texture_ids *out) {
+    return indirect_uniform_snapshot_at(u, 0, count, sampler, out);
 }
 typedef struct { uint64_t lo, size, seq, gpu; } ubo_shadow;
 #define UBO_SHADOW_MAX 512
@@ -3247,6 +3315,10 @@ uint64_t mtl_upload_bytes(void) { return g_bp_up_bytes; }   // 贴图上传累�
 typedef struct { void *tex; uint64_t fence; reup_key k; } reup_ent;   // tex: CFBridgingRetain'd MTLTexture
 static reup_ent g_reup[REUP_MAX]; static int g_nreup; static os_unfair_lock g_reup_lk = OS_UNFAIR_LOCK_INIT;
 static uint64_t g_reup_reused, g_reup_kept;
+static int g_reup_pin_guard_negative;
+#ifdef HOGWARTS_EXPERIMENTAL
+static int g_reup_3d_guard_negative;
+#endif
 static int reup_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_REUP_RECYCLE"); on = !e || atoi(e); } return on; }
 static reup_key reup_key_of(MTLTextureDescriptor *d) {
     reup_key k; memset(&k, 0, sizeof k); MTLTextureSwizzleChannels z = d.swizzle;
@@ -3256,6 +3328,11 @@ static reup_key reup_key_of(MTLTextureDescriptor *d) {
 }
 /* The texture a re-upload replaced (k: the description it was created from): keep it for reuse, or retire it as before. */
 static int reup_offer(id<MTLTexture> old, const reup_key *k) {
+#ifdef HOGWARTS_EXPERIMENTAL
+    /* A cached view can outlive its serial. Until views carry generations, do
+       not recycle allocations usable by Hogwarts' indirect texture arrays. */
+    if (old && old.textureType == MTLTextureType3D && !g_reup_3d_guard_negative) return 0;
+#endif
     if (old && k && k->pf && reup_on() && old.allocatedSize <= REUP_MAX_BYTES) {
         os_unfair_lock_lock(&g_reup_lk);
         if (g_nreup < REUP_MAX) { g_reup[g_nreup++] = (reup_ent){(void *)CFBridgingRetain(old), g_fence + 1, *k}; g_reup_kept++; os_unfair_lock_unlock(&g_reup_lk); return 1; }
@@ -3276,7 +3353,26 @@ static id<MTLTexture> reup_take(const reup_key *k) {
     os_unfair_lock_lock(&g_reup_lk);
     for (int i = 0; i < g_nreup; i++) {
         if (g_reup[i].fence > done) continue;
-        if (!hit && !memcmp(&g_reup[i].k, k, sizeof *k)) { hit = CFBridgingRelease(g_reup[i].tex); g_reup[i--] = g_reup[--g_nreup]; continue; }
+        id<MTLTexture> candidate = (__bridge id<MTLTexture>)g_reup[i].tex;
+        pthread_mutex_lock(&g_res_mu);
+        NvResidencyPin *pin = [g_res_pins objectForKey:candidate];
+        int pinned = pin && pin->count;
+        int resident = [g_res_objects containsObject:candidate];
+        int take = resident && (!pinned || g_reup_pin_guard_negative) &&
+                   !hit && !memcmp(&g_reup[i].k, k, sizeof *k);
+        if (take) {
+            if (!g_res_recycled) g_res_recycled = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality];
+            [g_res_recycled addObject:candidate];
+        }
+        pthread_mutex_unlock(&g_res_mu);
+        if (pinned && !g_reup_pin_guard_negative) continue;
+        if (!resident) {
+            MLOG("re-upload recycler: discarding nonresident texture");
+            CFBridgingRelease(g_reup[i].tex);
+            g_reup[i--] = g_reup[--g_nreup];
+            continue;
+        }
+        if (take) { hit = CFBridgingRelease(g_reup[i].tex); g_reup[i--] = g_reup[--g_nreup]; continue; }
         if (g_reup[i].fence + REUP_IDLE < done) { defer_obj_release(CFBridgingRelease(g_reup[i].tex)); g_reup[i--] = g_reup[--g_nreup]; }
     }
     os_unfair_lock_unlock(&g_reup_lk);
@@ -3638,12 +3734,28 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
 }
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = g_pkg_uploads; *reuploads = g_pkg_reuploads; }
 uint64_t mtl_pkg_miss(void) { return g_pkg_miss; }
+#ifdef HOGWARTS_EXPERIMENTAL
+static dispatch_semaphore_t g_finalize_probe_deleted, g_finalize_probe_resume;
+static int g_finalize_probe_unlocked;
+#endif
 void mtl_tex_release(tex_t *t) {
     if (!t->serial) return;
+#ifdef HOGWARTS_EXPERIMENTAL
+    if (!g_finalize_probe_unlocked) registry_lock();
+#endif
     BOTW_SERIAL_NOTE(t->serial, "nvnTextureFinalize") BOTW_TEX_RELEASE_KEEP(t->serial) serial_del(t->serial);
+#ifdef HOGWARTS_EXPERIMENTAL
+    if (g_finalize_probe_deleted) {
+        dispatch_semaphore_signal(g_finalize_probe_deleted);
+        dispatch_semaphore_wait(g_finalize_probe_resume, DISPATCH_TIME_FOREVER);
+    }
+#endif
     pthread_mutex_lock(&g_smu); totk_serial_add(&g_dead_serial, t->serial); ser_bump_locked(t->serial); pthread_mutex_unlock(&g_smu);   // view caches of this serial look again (dead-serial follow)
     treg_drop_serial(t->serial);
     serial_forget_if_unreferenced(t->serial);   // nothing names it any more: no need to remember it
+#ifdef HOGWARTS_EXPERIMENTAL
+    if (!g_finalize_probe_unlocked) registry_unlock();
+#endif
 }
 /* TOTK (2026-10-17): not yet. A finalized serial must stay remembered while a texture-pool slot still names it: tex_by_id
    follows such a slot to the live texture at the same storage only for a remembered serial. The first version forgot a
@@ -5028,6 +5140,15 @@ static id<MTLLibrary> shader_lib_prebuilt(NSData *src) {
     return lib;
 }
 #endif
+static int hogwarts_indirect_diagnostic(void) {
+#ifdef HOGWARTS_EXPERIMENTAL
+    const char *enabled = getenv("HOGWARTS_INDIRECT_PREFLIGHT");
+    const char *dry = getenv("HOGWARTS_SKIP_INDIRECT_DRY_RUN");
+    return (enabled && !strcmp(enabled, "1")) || (dry && !strcmp(dry, "1"));
+#else
+    return 0;
+#endif
+}
 static NvShader *shader_load(NSString *pc, int stage) {
     NSError *e = nil;
     // TOTK: runtime translations are MSL source compiled here (macOS allows runtime compilation); the OS caches compiled code.
@@ -5057,7 +5178,29 @@ static NvShader *shader_load(NSString *pc, int stage) {
     if (![j[@"chain"] isEqual:@DMSH_CHAIN]) { MLOG("【红】着色器 %s 的翻译链版本 %s 与本宿主期望的 %s 不符", pc.UTF8String, [[j[@"chain"] description] UTF8String], DMSH_CHAIN); return nil; }
     NvShader *o = [NvShader new];
     char err[160];
-    if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("【红】着色器 %s 反射转换失败：%s", pc.UTF8String, err); return nil; }
+    int reflection_error;
+#ifdef HOGWARTS_EXPERIMENTAL
+    const char *scalar_dry = getenv("HOGWARTS_SKIP_INDIRECT_DRY_RUN");
+    if (scalar_dry && !strcmp(scalar_dry, "1")) {
+        if (!nogpu()) MDIE("scalar indirect diagnostic requires GPU submission disabled");
+        reflection_error = nvn_refl_from_json_scalar_diagnostic(j, &o->rf, err, sizeof err);
+    } else
+#endif
+    reflection_error = nvn_refl_from_json(j, &o->rf, err, sizeof err);
+    if (reflection_error) { MLOG("【红】着色器 %s 反射转换失败：%s", pc.UTF8String, err); return nil; }
+    for (int i = 0; i < o->rf.nb; i++) {
+        const nvn_rbind *b = &o->rf.b[i];
+        if ((b->kind == NVN_RB_ITEX || b->kind == NVN_RB_ISAMP ||
+             b->kind == NVN_RB_SCALAR_ITEX || b->kind == NVN_RB_SCALAR_ISAMP) &&
+            !(stage == 1 && hogwarts_indirect_diagnostic())) {
+            MLOG("【红】shader %s indirect texture array: uniform %u, sampler %u, count %u; GPU timeline and binding not implemented",
+                 pc.UTF8String, b->reg, b->off, b->indirect_count);
+#ifdef HOGWARTS_EXPERIMENTAL
+            MLOG("Hogwarts diagnostic: game draw intentionally refused; indirect texture GPU dependencies and lifetime are not implemented");
+#endif
+            return nil;
+        }
+    }
     if (rt_range_on()) o->range_ro=rt_range_bindings_ro(j);
     o->fn = [lib newFunctionWithName:j[@"entry"]]; o->stage = stage; strlcpy(o->key, pc.UTF8String, sizeof o->key);
     NSString *full = rt ? [NSString stringWithContentsOfFile:rt_src encoding:NSUTF8StringEncoding error:nil] : nil;
@@ -5076,11 +5219,10 @@ static NvShader *shader_load(NSString *pc, int stage) {
     if (keep_src) o->src = full;
     if (o->rf.nb) {
         o->ae = [o->fn newArgumentEncoderWithBufferIndex:o->rf.abi];
-        int max_aid = -1;
-        for (int i = 0; i < o->rf.nb; i++) max_aid = MAX(max_aid, o->rf.b[i].aid);
+        int slots = nvn_refl_argument_slots(&o->rf);
         o->arg_len = o->ae.encodedLength;
-        if (o->arg_len != (NSUInteger)(8 * (max_aid + 1)) || (o->arg_len & 7))
-            MDIE("着色器 %s 参数块布局异常：encodedLength=%lu maxAid=%d", o->key, (unsigned long)o->arg_len, max_aid);
+        if (slots < 0 || o->arg_len != (NSUInteger)(8 * slots) || (o->arg_len & 7))
+            MDIE("着色器 %s 参数块布局异常：encodedLength=%lu slots=%d", o->key, (unsigned long)o->arg_len, slots);
     }
     if (o->rf.has_c1) c1_store(o, full);
     return o;
@@ -5509,6 +5651,9 @@ static uint8_t treg_kind(const tex_t *t) {
     if (t->d.target == 10 && ((uintptr_t)t->mem & 15)) return 2;
     return tex_mirrored(t) ? (pkg_hashed(t) ? 2 : 1) : 0;
 }
+#ifdef HOGWARTS_EXPERIMENTAL
+static int g_hogwarts_view_failure_probe, g_hogwarts_view_fallback_negative;
+#endif
 static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller holds g_rmu
     if (g_tpool_n && tid >= g_tpool_n) { if (!g_stat_tex_oob++) MLOG("池外贴图号 %d（池容量 %d）按空槽处理：读出 0", tid, g_tpool_n); return nil; }
     if (tid < 0 || tid >= g_ntreg || !g_treg[tid].ok) { RED_ONCE(10, "贴图号 %d 未登记", tid); return nil; }
@@ -5551,10 +5696,11 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
     v = base;
     MTLTextureSwizzleChannels vsw = MTLTextureSwizzleChannelsDefault;
     int need_swz = tex_swizzle_sel(&r.t, r.has_v && r.v.set_swizzle ? r.v.swz : NULL, r.has_v && r.v.set_format ? r.v.format : r.t.d.format, &vsw) || !swizzle_eq(base.swizzle, MTLTextureSwizzleChannelsDefault);
-    if (need_swz || (r.has_v && (r.v.set_format || r.v.set_levels || r.v.set_layers || r.v.set_target || r.v.set_stencil))) {
+    int stencil = nvn_sample_stencil(&r.t, r.has_v ? &r.v : NULL);
+    if (need_swz || stencil || (r.has_v && (r.v.set_format || r.v.set_levels || r.v.set_layers || r.v.set_target))) {
         uint32_t pf = (uint32_t)base.pixelFormat; uint8_t swz[4];
         if (r.v.set_format && !(nvn_fmt_to_mtl(r.v.format, &pf, swz) && pf)) pf = (uint32_t)base.pixelFormat;
-        if (r.v.set_stencil) {   // Bayonetta 3: the stencil plane of a depth-stencil texture, read as an unsigned integer texture
+        if (stencil) {   // The stencil plane is read as an unsigned integer texture.
             if (base.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) pf = MTLPixelFormatX32_Stencil8;
             else if (base.pixelFormat != MTLPixelFormatStencil8) MDIE("texture id %d: stencil view of Metal format %lu", tid, (unsigned long)base.pixelFormat);
             if (pf != base.pixelFormat && !(base.usage & MTLTextureUsagePixelFormatView)) {
@@ -5593,9 +5739,21 @@ static id<MTLTexture> tex_by_id(int tid) {   // 调用方持 g_rmu | Caller hold
                        r.v.set_target ? "" : "(unset)", r.v.target, (unsigned long)base.pixelFormat, (unsigned long)base.mipmapLevelCount, (unsigned long)slices);
               return nil;
           } }
-        v = need_swz ? [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns) swizzle:vsw]
-                     : [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)];
-        if (!v) { RED_ONCE(11, "贴图视图建不出 id %d", tid); v = base; }
+#ifdef HOGWARTS_EXPERIMENTAL
+        if (g_hogwarts_view_failure_probe) v = nil;
+        else
+#endif
+            v = need_swz ? [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns) swizzle:vsw]
+                         : [base newTextureViewWithPixelFormat:(MTLPixelFormat)pf textureType:tt levels:NSMakeRange(l0, nl) slices:NSMakeRange(s0, ns)];
+        if (!v) {
+            RED_ONCE(11, "贴图视图建不出 id %d", tid);
+#ifdef HOGWARTS_EXPERIMENTAL
+            if (!g_hogwarts_view_fallback_negative) return nil;
+            v = base;
+#else
+            v = base;
+#endif
+        }
     }
     rp->view = (void *)CFBridgingRetain(v); rp->view_rid = v.gpuResourceID._impl; rp->view_ser = sg; rp->view_pkg = treg_kind(&rp->t); rp->view_dirty = rp->view_pkg == 2 || (rp->view_pkg == 1 && tex_check_once()) ? g_sub_serial : dg;
     treg_link_locked(tid);
@@ -5645,6 +5803,107 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // 调用方持 g_rmu | Calle
 static inline __attribute__((always_inline)) void *samp_fast(int sid) {
     if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid] && g_sview[sid]) return g_sview[sid];
     return (__bridge void *)samp_by_id(sid);
+}
+@interface NvIndirectLease : NSObject
+@property(nonatomic, strong) NSMutableArray<id<MTLResource>> *allocations;
+@property(nonatomic, strong) NSMutableArray *objects;
+- (void)releasePins;
+@end
+@implementation NvIndirectLease
+- (instancetype)init {
+    if ((self = [super init])) { _allocations = [NSMutableArray array]; _objects = [NSMutableArray array]; }
+    return self;
+}
+- (void)releasePins {
+    for (id<MTLResource> allocation in _allocations) res_unpin(allocation);
+    [_allocations removeAllObjects];
+    [_objects removeAllObjects];
+}
+- (void)dealloc { [self releasePins]; }
+@end
+/* Caller holds the descriptor registry lock. The loader still rejects indirect
+   shaders until render-pass dependencies and resource lifetime are handled. */
+static int g_indirect_dead_guard_negative;
+static int indirect_resolve_registered_type(void *context, nvn_indirect_texture_ids ids,
+                                            uint64_t *texture, uint64_t *sampler,
+                                            MTLTextureType expected_type) {
+    int tid = (int)ids.texture_id, sid = (int)ids.sampler_id;
+    if (tid <= 0 || tid >= g_ntreg || !g_treg[tid].ok ||
+        (g_tpool_n && tid >= g_tpool_n) || sid <= 0 || sid >= g_nsreg ||
+        !g_sreg_ok[sid] || samp_border_custom(&g_sreg[sid])) return 0;
+    void *view = NULL;
+    uint64_t trid = tex_fast_rid(tid, &view);
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)view;
+    if (!tex || !trid || g_tex_prepare_split ||
+        (!g_indirect_dead_guard_negative &&
+         (g_treg[tid].dead_pending || serial_is_dead(g_treg[tid].t.serial))) ||
+        tex.textureType != expected_type ||
+        (tex.pixelFormat != MTLPixelFormatR32Float && tex.pixelFormat != MTLPixelFormatRGBA8Unorm &&
+         tex.pixelFormat != MTLPixelFormatBGRA8Unorm &&
+         !(expected_type == MTLTextureType2D &&
+           (tex.pixelFormat == MTLPixelFormatASTC_8x8_sRGB ||
+            tex.pixelFormat == MTLPixelFormatBC7_RGBAUnorm_sRGB))))
+        return 0;
+    id<MTLTexture> base = tex;
+    while (base.parentTexture) base = base.parentTexture;
+    id<MTLResource> allocation = base.buffer ? (id<MTLResource>)base.buffer : (id<MTLResource>)base;
+    id<MTLSamplerState> state = (__bridge id<MTLSamplerState>)samp_fast(sid);
+    if (!state || !g_srid[sid]) return 0;
+    if (context) {
+        NvIndirectLease *lease = (__bridge NvIndirectLease *)context;
+        if (!res_pin(allocation)) return 0;
+        [lease.allocations addObject:allocation];
+        [lease.objects addObject:tex]; [lease.objects addObject:state];
+    } else {
+        pthread_mutex_lock(&g_res_mu);
+        int resident = [g_res_objects containsObject:allocation];
+        pthread_mutex_unlock(&g_res_mu);
+        if (!resident) return 0;
+    }
+    *texture = trid; *sampler = g_srid[sid];
+    return 1;
+}
+static int indirect_resolve_registered(void *context, nvn_indirect_texture_ids ids,
+                                       uint64_t *texture, uint64_t *sampler) {
+    return indirect_resolve_registered_type(context, ids, texture, sampler, MTLTextureType3D);
+}
+#ifdef HOGWARTS_EXPERIMENTAL
+static int indirect_resolve_registered_2d(void *context, nvn_indirect_texture_ids ids,
+                                          uint64_t *texture, uint64_t *sampler) {
+    return indirect_resolve_registered_type(context, ids, texture, sampler, MTLTextureType2D);
+}
+static int indirect_resolve_registered_cube(void *context, nvn_indirect_texture_ids ids,
+                                            uint64_t *texture, uint64_t *sampler) {
+    return indirect_resolve_registered_type(context, ids, texture, sampler, MTLTextureTypeCube);
+}
+#endif
+
+/* Caller holds the descriptor registry lock on the submission thread. */
+static int indirect_build_snapshot_slots_with_ids(const p_bind_buf *uniform, uint32_t sampler_handle,
+                                                  const nvn_rbind *tex, const nvn_rbind *samp,
+                                                  uint64_t *slots, size_t slot_count, unsigned *failed_index,
+                                                  nvn_indirect_texture_ids *decoded_ids) {
+    if (!g_cb || !g_commit_blocks || !tex || !samp || tex->kind != NVN_RB_ITEX || samp->kind != NVN_RB_ISAMP ||
+        !tex->indirect_count || tex->indirect_count > 32 ||
+        tex->indirect_count != samp->indirect_count || tex->reg != samp->reg || tex->off != samp->off)
+        return NVN_INDIRECT_INVALID;
+    nvn_indirect_texture_ids ids[32];
+    if (!indirect_uniform_snapshot(uniform, tex->indirect_count, sampler_handle, ids))
+        return NVN_INDIRECT_SNAPSHOT_UNAVAILABLE;
+    if (decoded_ids) memcpy(decoded_ids, ids, tex->indirect_count * sizeof *ids);
+    NvIndirectLease *lease = [NvIndirectLease new];
+    int result = nvn_indirect_texture_bind_ids(ids, tex->indirect_count, slots, slot_count,
+                                                tex->aid, samp->aid, indirect_resolve_registered,
+                                                (__bridge void *)lease, failed_index);
+    if (result == NVN_INDIRECT_OK) [g_commit_blocks addObject:^{ [lease releasePins]; }];
+    else [lease releasePins];
+    return result;
+}
+static int indirect_build_snapshot_slots(const p_bind_buf *uniform, uint32_t sampler_handle,
+                                         const nvn_rbind *tex, const nvn_rbind *samp,
+                                         uint64_t *slots, size_t slot_count, unsigned *failed_index) {
+    return indirect_build_snapshot_slots_with_ids(uniform, sampler_handle, tex, samp,
+                                                   slots, slot_count, failed_index, NULL);
 }
 
 // ---------- 参数缓冲区块：每次提交一块，GPU 完成后回收 ----------
@@ -7282,13 +7541,17 @@ static const uint8_t *bound_uniform_bytes(uint64_t gpu, size_t size, id<MTLBuffe
     }
     return NULL; // e.g. the special UI motion matrix ring: do not label live bytes as bound bytes
 }
+static int shader_has_indirect_textures(NvShader *sh) {
+    return sh->rf.has_indirect_textures != 0;
+}
 static int arg_epoch_safe(NvShader *sh) {
     if (!sh->ab_epoch_ok) {
         sh->ab_epoch_ok = 1;
         for (int i = 0; i < sh->rf.nb; i++) {
             const nvn_rbind *b = &sh->rf.b[i];
             // Indirect pointers and writable bindings have replay-time side effects.
-            if (b->rw || b->kind == NVN_RB_IMG || b->kind == NVN_RB_SBUFU) { sh->ab_epoch_ok = -1; break; }
+            if (b->rw || b->kind == NVN_RB_IMG || b->kind == NVN_RB_SBUFU ||
+                b->kind == NVN_RB_ITEX || b->kind == NVN_RB_ISAMP) { sh->ab_epoch_ok = -1; break; }
         }
     }
     return sh->ab_epoch_ok > 0;
@@ -7306,7 +7569,22 @@ static int tex_slots_diagnostics(void) {
     if (active < 0) active = getenv("DM_NVN_TEXPNG_FS") != NULL || getenv("DM_NVN_FLASHHDR") != NULL;
     return active;
 }
-static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
+enum { INDIRECT_BINDING_OK, INDIRECT_BINDING_FALLBACK, INDIRECT_BINDING_INVALID_RANGE };
+typedef struct {
+    uint64_t slots[NVN_REFL_MAXB];
+    uint8_t issue[NVN_REFL_MAXB];
+} indirect_argument_capture;
+static int indirect_uniform_range_matches(const p_bind_buf *u, void *mb, uint64_t mo, uint64_t gpu) {
+    void *full_mb; uint64_t full_mo, full_gpu;
+    return u && u->size && mtl_gpu_addr(u->addr, u->size, &full_mb, &full_mo, &full_gpu) &&
+           full_mb == mb && full_mo == mo && full_gpu == gpu;
+}
+static int encode_args_impl(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex,
+                            int indirect_probe, indirect_argument_capture *capture) {
+    if (capture && (!indirect_probe || en || !nogpu()))
+        MDIE("indirect argument capture requires a probe without GPU submission");
+    if (shader_has_indirect_textures(sh) && !indirect_probe)
+        MDIE("indirect shader reached production argument encoding before replay support");
     if (!sh->ae) return 1;
     if (nvn_stage == 1 && !strncmp(sh->key, "0ac9a54938974396", 16) && getenv("DM_NVN_FLASHHDR") && R.rt.n && R.rt.color[0])
         g_flash_tonemap_target = tex_mtl(R.rt.color[0]);
@@ -7323,7 +7601,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         epoch_hit = sh->ab_buf && !memcmp(&epoch, &sh->ab_epoch, sizeof epoch);
         registry_unlock();
     }
-    int reuse = !ab_noreuse && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
+    int reuse = !ab_noreuse && !shader_has_indirect_textures(sh) && !passdump() && sh->ab_buf && sh->ab_pass == g_pass.serial && nvn_stage != 5 &&
         (epoch_mode ? epoch_hit : !g_args_dirty[nvn_stage]);
     int verify_epoch = reuse && epoch_mode && atomic_load_explicit(&g_arg_epoch_check, memory_order_relaxed);
     if (reuse) {
@@ -7346,6 +7624,32 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     tex_slot_key slot_key = {0}; uint64_t slot_mask = 0, slot_hits = 0, slot_misses = 0;
     uint64_t handles[NVN_REFL_MAXB];
     registry_lock();   // 贴图 / 采样器登记表可能正被游戏线程扩容或改写 | The texture / sampler registration tables may be being grown or rewritten by the game thread
+    if (indirect_probe && shader_has_indirect_textures(sh)) {
+        const nvn_rbind *tex = NULL, *samp = NULL;
+        if (nvn_stage >= 0 && nvn_stage < 6) {
+            for (int i = 0; i < sh->rf.nb; i++) {
+                if (sh->rf.b[i].kind == NVN_RB_ITEX) {
+                    if (tex) { tex = NULL; break; }
+                    tex = &sh->rf.b[i];
+                } else if (sh->rf.b[i].kind == NVN_RB_ISAMP) {
+                    if (samp) { samp = NULL; break; }
+                    samp = &sh->rf.b[i];
+                }
+            }
+        }
+        int result = NVN_INDIRECT_INVALID; unsigned failed = 0;
+        if (tex && samp && tex->reg < 16 && tex->off < 128 &&
+            sh->arg_len <= sizeof slots && sh->arg_len == sh->ae.encodedLength &&
+            nvn_refl_argument_slots(&sh->rf) == (int)(sh->arg_len / sizeof *slots))
+            result = indirect_build_snapshot_slots(&S.ubo[nvn_stage][tex->reg],
+                (uint32_t)S.samp[nvn_stage][tex->off], tex, samp,
+                slots, sh->arg_len / sizeof *slots, &failed);
+        if (result != NVN_INDIRECT_OK) {
+            registry_unlock();
+            MLOG("indirect argument probe rejected stage %d: reason %d index %u", nvn_stage, result, failed);
+            return 0;
+        }
+    }
     int slot_context = 0;
     if (slot_mode) {
         slot_key = (tex_slot_key){g_pass.serial, g_arena_epoch, g_reg_gen, g_ser_gen,
@@ -7367,10 +7671,14 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                 if (!slot_check) { slots[aid] = sh->tex_slots.slots[aid]; continue; }
             } else slot_misses++;
         }
-        if (b->kind == NVN_RB_CBUF) {
+        if (indirect_probe && (b->kind == NVN_RB_ITEX || b->kind == NVN_RB_ISAMP)) {
+            continue;
+        } else if (b->kind == NVN_RB_CBUF) {
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
             void *mb; uint64_t mo, gpu;
-            if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
+            if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { if (capture) capture->issue[aid] = INDIRECT_BINDING_FALLBACK; RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
+            if (capture && !indirect_uniform_range_matches(u, mb, mo, gpu))
+                capture->issue[aid] = INDIRECT_BINDING_INVALID_RANGE;
             use_rec("buf", u->addr, u->size, 0, NULL);
             uint64_t ren = g_nupd ? upd_shadow(u->addr, u->size) : 0;   // TOTK: renamed inline updates (see upd_shadow)
             if (ren) { gpu = ren; if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) RED_ONCE(58, "UI 矩阵修补读的是内存，跳过了含内联更新的 uniform 副本"); }
@@ -7402,6 +7710,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         } else if (b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT) {   // SAMPT：合并句柄（贴图号 | 采样器号 << 20）的采样器部分 | SAMPT: the sampler part of a combined handle (texture ID | sampler ID << 20)
             int sid = reg < 128 ? (int)((b->kind == NVN_RB_SAMPT ? S.tex[nvn_stage][reg] : S.samp[nvn_stage][reg]) >> 20) : 0;
             __unsafe_unretained id<MTLSamplerState> ss = sid ? (__bridge id<MTLSamplerState>)samp_fast(sid) : nil;
+            if (capture && !(sid && sid < g_nsreg && g_srid[sid])) capture->issue[aid] = INDIRECT_BINDING_FALLBACK;
             slots[aid] = sid && sid < g_nsreg && g_srid[sid] ? g_srid[sid] : dummy_samp_rid();
             USE(ss ? ss : dummy_samp(), MTLResourceUsageRead);
             if (bl && sid > 0) { int ok = sid < g_nsreg && g_sreg_ok[sid]; samp_par sp = ok ? g_sreg[sid] : (samp_par){0};   // 本段已持 g_rmu | g_rmu is already held in this section
@@ -7429,7 +7738,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
                     tid < g_ntreg ? (void *)g_treg[tid].t.mem : NULL, tid < g_ntreg ? (unsigned long long)g_treg[tid].t.L.size : 0ull, tid < g_ntreg ? g_treg[tid].t.d.flags : 0u,
                     tid < g_ntreg ? g_treg[tid].t.d.levels : 0u, (__bridge void *)t, (__bridge void *)t.parentTexture);
             }
-            if (!t) { t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
+            if (!t) { if (capture) capture->issue[aid] = INDIRECT_BINDING_FALLBACK; t = dummy_tex(b->dtt, b->dpf); trid = g_dummy_tex_rid[b->dtt & 7][b->dpf & 3]; }
             else if ((b->dtt == MTLTextureType2DArray && t.textureType == MTLTextureType2D) || (b->dtt == MTLTextureType2D && t.textureType == MTLTextureType2DArray)) {
                 /* TOTK: the shader indexes a 2D texture as a 2D array (the UI glyph atlas: NVN clamps the layer to 0) or the reverse;
                    Metal needs a matching texture type in the argument buffer, so bind a cached 1-slice view of the right type. */
@@ -7465,7 +7774,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (t && t.textureType != MTLTextureTypeTextureBuffer) { RED_ONCE(40, "类型化缓冲槽绑的不是缓冲贴图（贴图号 %d 类型 %lu）", tid, (unsigned long)t.textureType); t = nil; }
             if (b->arr && atomic_load_explicit(&g_rtb_off, memory_order_relaxed)) t = nil;
             if (bl) PD("B %llu st%d tbuf reg%d tid=%d %s ser=%llu pf=%lu w=%lu mem=%p nvnfmt=%#x", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull, t ? (unsigned long)t.pixelFormat : 0ul, t ? (unsigned long)t.width : 0ul, tid < g_ntreg ? g_treg[tid].t.mem : NULL, tid < g_ntreg ? g_treg[tid].t.d.format : 0);
-            if (!t) { t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
+            if (!t) { if (capture) capture->issue[aid] = INDIRECT_BINDING_FALLBACK; t = dummy_tbuf(b->dpf); trid = g_dummy_tbuf_rid[b->dpf & 3]; }
             slots[aid] = trid;
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_SBUFU) {   // TOTK: the shader loads this storage buffer's address from a user uniform block (slot reg, byte offset off); resolve that pointer now
@@ -7504,7 +7813,7 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             if (ren) { slots[aid] = ren; USE(dummy_buf(), MTLResourceUsageRead); }
             else if (usc) { slots[aid] = usc->gpu + (u->addr - usc->lo); USE(dummy_buf(), MTLResourceUsageRead); }
             else if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
-            else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
+            else { if (capture) capture->issue[aid] = INDIRECT_BINDING_FALLBACK; slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) { /* TOTK: first 16 bytes and the count of non-zero 32-bit words (CPU view of the pool: what earlier GPU work left there) */
                 uint64_t nz = 0, nw = 0; uint32_t w4[4] = {0, 0, 0, 0}; void *mb2; uint64_t mo2;
                 if (u && u->addr && u->size && mtl_addr(u->addr, u->size, &mb2, &mo2)) { const uint32_t *q = (const uint32_t *)((const uint8_t *)[(__bridge id<MTLBuffer>)mb2 contents] + mo2); nw = u->size / 4; for (uint64_t i = 0; i < nw; i++) nz += q[i] != 0; memcpy(w4, q, nw >= 4 ? 16 : nw * 4); }
@@ -7551,6 +7860,10 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
         if (slot_check) atomic_fetch_add_explicit(&g_tex_slots_verified, slot_hits, memory_order_relaxed);
     }
     registry_unlock();
+    if (capture) {
+        memcpy(capture->slots, slots, sh->arg_len);
+        return 1;
+    }
     if (verify_epoch) {
         const uint64_t *prior = (const uint64_t *)((const uint8_t *)sh->ab_buf.contents + sh->ab_off);
         for (int i = 0; i < sh->rf.nb; i++) {
@@ -7576,6 +7889,9 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
     sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; sh->ab_epoch = epoch; g_args_dirty[nvn_stage] = 0;
     g_stat_args_enc++;
     return 1;
+}
+static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, int metal_vertex) {
+    return encode_args_impl(en, sh, nvn_stage, metal_vertex, 0, NULL);
 }
 static id<MTLBuffer> g_quad_ib; static uint64_t g_quad_gpu;
 static id<MTL4RenderCommandEncoder> rp_begin(void);
@@ -8197,6 +8513,7 @@ static int draw_samples_rt(NvProg *pr) {   // 采样附件保持原ser级保守g
     if (R.rt.depth) rs[nr++] = R.rt.depth->serial;
     if (!pr) return 1;
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
+        if (shader_has_indirect_textures(sh)) return 1;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 && sh->stage < 6 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 && sh->stage < 6 ? S.tex[sh->stage][b->reg] : 0; else continue;
             int tid = (int)(h & 0xfffff); if (!tid) continue;
@@ -8307,6 +8624,7 @@ static void sdx_walk(const uint8_t *p, int depth) {
                 __unsafe_unretained NvProg *pr = g_pp_prog ? prog_get(g_pp_prog) : nil;
                 if (!pr) { for (int st = 0; st < 6; st++) for (int k = 0; k < 160; k++) if (g_pp_slot[st][k]) sdx_ev_add((sdx_ev){seq, 0, g_pp_slot[st][k], p, 0, 0, SDX_READ, 0, 0, 1}); }
                 else for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || (h.op == OP_DISPATCH) != (st == 5)) continue;
+                    if (shader_has_indirect_textures(sh)) { g_sdx_ok = 0; break; }
                     for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; int k = b->kind == NVN_RB_IMG ? 128 + b->reg : (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) ? b->reg : -1;
                         if (k < 0 || k >= 160 || sh->stage < 0 || sh->stage >= 6) continue; uint64_t ser = g_pp_slot[sh->stage][k];
                         if (ser) sdx_ev_add((sdx_ev){seq, 0, ser, p, 0, 0, SDX_READ, 0, 0, 1}); } }
@@ -8336,7 +8654,7 @@ void mtl_sub_index(const uint64_t *h, int n) {   // 提交开始（hle_nvn.c Que
                                      for (int k = 0; k < 32; k++) g_pp_slot[st][128 + k] = S.img[st][k] ? h_ser(S.img[st][k]) : 0; }
     g_sdx_ren = 1;
     for (int i = 0; i < n && g_sdx_ok; i++) sdx_walk((const uint8_t *)h[i], 0);
-    if (!g_sdx_ok) return;
+    if (!g_sdx_ok) { g_xv_n = 0; g_xv_block = 1; return; }
     // 计数排序到桶：事件本按序号追加，同一序号内 READ 先于 ATT（同一绘制先判读后判附件），稳定散列后桶内有序
     // Counting sort into buckets: events are appended in sequence-number order, and within the same sequence number READ precedes ATT (the same draw is judged for reads first, then attachments), so after a stable scatter each bucket is ordered
     memset(g_sdx_bcnt, 0, (g_sdx_nb + 1) * sizeof *g_sdx_bcnt);
@@ -8537,6 +8855,7 @@ static int sub_eq(const p_set_rt *a, int ka, const p_set_rt *b, int kb) { uint64
 static int prog_samples_ser(const prog_t *pg, uint64_t tex[6][128], uint64_t img[6][32], uint64_t ser) {   // TOTK: a program with an untranslated stage counts as reading everything   // 程序反射声明的贴图 / 图像 / 类型化缓冲槽里有没有绑着该贴图 | Whether this texture is bound in any texture / image / typed buffer slot declared by the program's reflection
     __unsafe_unretained NvProg *pr = pg ? prog_get(pg) : nil; if (!pr || pr->missing) return 1;
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage >= 6) continue;
+        if (shader_has_indirect_textures(sh)) return 1;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? tex[sh->stage][b->reg] : 0; else continue;
             if (h && h_ser(h) == ser) return 1; } }
@@ -8558,6 +8877,7 @@ static int defer_handle_sub(uint64_t h, const p_set_rt *r, int k, int cover) {
 static int defer_prog_hits(const prog_t *pg, uint64_t tex[6][128], uint64_t img[6][32], const p_set_rt *r, int color_only, int cover) {
     __unsafe_unretained NvProg *pr = pg ? prog_get(pg) : nil; if (!pr || pr->missing) return 1;
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage < 0 || sh->stage >= 6) continue;
+        if (shader_has_indirect_textures(sh)) return 1;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h = 0;
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? img[sh->stage][b->reg] : 0;
             else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? tex[sh->stage][b->reg] : 0;
@@ -8570,7 +8890,9 @@ static int defer_prog_hits(const prog_t *pg, uint64_t tex[6][128], uint64_t img[
 }
 static void defer_collect_reads(defer_t *d, const prog_t *pg, uint64_t tex[6][128], uint64_t img[6][32]) {
     __unsafe_unretained NvProg *pr = pg ? prog_get(pg) : nil; if (!pr || pr->missing) { d->nreads = 513; return; }
+    if (d->nreads > 512) return;
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage < 0 || sh->stage >= 6) continue;
+        if (shader_has_indirect_textures(sh)) { d->nreads = 513; return; }
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h = 0;
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? img[sh->stage][b->reg] : 0;
             else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? tex[sh->stage][b->reg] : 0;
@@ -8698,6 +9020,7 @@ static void defer_try(const p_draw *dw, const p_draw_idx *di) {
     g_defer.clear_d = R.clear_d; g_defer.clear_s = R.clear_s; g_defer.cd = R.cd; g_defer.cs = R.cs;
     uint64_t tex[6][128], img[6][32]; memcpy(tex, S.tex, sizeof tex); memcpy(img, S.img, sizeof img); const prog_t *pg = S.prog; ds_st ds = S.ds;
     const uint8_t *p = g_exec_next, *p_end = NULL, *qop = NULL; const p_set_rt *q = NULL; p_set_rt scan_rt = R.rt; int srt_hit = -1, ci = 0, draws = 1, p_has_draw = 1; defer_collect_reads(&g_defer, pg, tex, img);   // 当前这次绘制就是 P 的第一次 | The current draw is P's first
+    if (g_defer.nreads > 512) { g_defer.reason = 7; goto fail; }
     for (int guard = 0; guard < 200000; guard++) {
         op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
         if (g_hoist_n && hoist_skipped(p)) { p += h.size; continue; }
@@ -8716,7 +9039,7 @@ static void defer_try(const p_draw *dw, const p_draw_idx *di) {
                     if (srt_hit) { g_defer.reason = 12; goto fail; }
                     if (scan_rt.depth && g_defer.p_rt.depth && scan_rt.depth->serial == g_defer.p_rt.depth->serial && (ds.dw || (g_defer.p_st && ds.st))) { g_defer.reason = 13; goto fail; }
                     break; }
-                draws++; if (draws > 64) { g_defer.reason = 20; goto fail; } p_has_draw = 1; defer_collect_reads(&g_defer, pg, tex, img); g_defer.p_dw |= ds.dw; g_defer.p_st |= ds.st && ((S.st_wmask[0] | S.st_wmask[1]) != 0) && (ds.fail_f != NVN_STENCIL_OP_KEEP || ds.zfail_f != NVN_STENCIL_OP_KEEP || ds.zpass_f != NVN_STENCIL_OP_KEEP || ds.fail_b != NVN_STENCIL_OP_KEEP || ds.zfail_b != NVN_STENCIL_OP_KEEP || ds.zpass_b != NVN_STENCIL_OP_KEEP); if (g_defer.p_dw) { g_defer.reason = 8; goto fail; } break;
+                draws++; if (draws > 64) { g_defer.reason = 20; goto fail; } p_has_draw = 1; defer_collect_reads(&g_defer, pg, tex, img); if (g_defer.nreads > 512) { g_defer.reason = 7; goto fail; } g_defer.p_dw |= ds.dw; g_defer.p_st |= ds.st && ((S.st_wmask[0] | S.st_wmask[1]) != 0) && (ds.fail_f != NVN_STENCIL_OP_KEEP || ds.zfail_f != NVN_STENCIL_OP_KEEP || ds.zpass_f != NVN_STENCIL_OP_KEEP || ds.fail_b != NVN_STENCIL_OP_KEEP || ds.zfail_b != NVN_STENCIL_OP_KEEP || ds.zpass_b != NVN_STENCIL_OP_KEEP); if (g_defer.p_dw) { g_defer.reason = 8; goto fail; } break;
             case OP_RESET_COUNTER: g_defer.reset_between = 1; break;
             case OP_COPY_T2T: { const p_copy_t2t *c = a;   // 贴图拷贝：两端都不碰 P 的附件、目标不是 P 采样的贴图才放行 | Texture copy: allowed only if neither end touches P's attachments and the destination is not a texture P samples
                 uint64_t ss = c->src ? c->src->serial : 0, ds_ = c->dst ? c->dst->serial : 0; int bad = !ss || !ds_;
@@ -8901,6 +9224,7 @@ planned:
         if (!vs2 || !fs2) return;
         int touches = 0;
         for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr2->sh[st]; if (!sh || sh->stage >= 6) continue;
+            if (shader_has_indirect_textures(sh)) return;
             for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *bb = &sh->rf.b[i]; uint64_t h;
                 if (bb->kind == NVN_RB_IMG) h = bb->reg < 32 ? i2[sh->stage][bb->reg] : 0; else if (bb->kind == NVN_RB_TEX || bb->kind == NVN_RB_TBUF) h = bb->reg < 128 ? t2[sh->stage][bb->reg] : 0; else continue;
                 uint64_t ser = h ? h_ser(h) : 0; if (!ser) continue;
@@ -9002,6 +9326,7 @@ static int zskip_can_draw(NvProg *pr) {
     // Reasons for not holding (the N line of PASSDUMP): 1 depth / stencil 2 occlusion query counting with a report before the reset 3 coefficient unreadable or non-finite 4 image slot 5 sampled view not known all zero 6 no target 7 target is not 0
     if (!zskip_on() || !pr) return 0;
     NvShader *fs = nil; for (int st = 0; st < 5; st++) if (pr->sh[st] && pr->sh[st]->stage == 1) fs = pr->sh[st];
+    for (int st = 0; st < 5; st++) if (pr->sh[st] && shader_has_indirect_textures(pr->sh[st])) return 0;
     zskip_fact f; float coeff; int why = 0;
     if (!fs || !zskip_fact_for(fs->key, &f)) return 0;
     if (S.ds.dw || S.ds.st) why = 1;
@@ -9042,6 +9367,7 @@ static int fz_p2_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di, uint8_
     if (!g_fz.rt2.depth && R.rt.depth && (S.ds.dt || S.ds.dw || S.ds.st)) { PD("F %llu 证不出：深度来自前一个通道而本次绘制开了深度模板测试", g_stat_pass); return 0; }
     int fx[32]; for (int i = 0; i < 32; i++) fx[i] = -1; uint8_t fbmask = 0;
     for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh || sh->stage >= 6) continue;
+        if (shader_has_indirect_textures(sh)) return 0;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; uint64_t h;
             if (b->kind == NVN_RB_IMG) h = b->reg < 32 ? S.img[sh->stage][b->reg] : 0; else if (b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) h = b->reg < 128 ? S.tex[sh->stage][b->reg] : 0; else continue;
             uint64_t ser = h ? h_ser(h) : 0; if (!ser) continue;
@@ -9525,8 +9851,441 @@ static void clear_ds_quad(const p_clear_ds *c) {
         if (x1 <= x0 || y1 <= y0) return; sc = (MTLScissorRect){x0, y0, x1 - x0, y1 - y0}; }
     clear_ds_core(en, g_pass.cfmt, g_pass.hd ? g_pass.dfmt : 0, g_pass.hs ? g_pass.sfmt : 0, g_pass.samples, tw, th, c, sc);
 }
-static void prepare_draw_textures(NvProg *pr) {
-    if (!pr) return;
+static int indirect_rt_relation(const tex_t *sampled, const p_set_rt *rt) {
+    if (!sampled || !rt || rt->n < 0 || rt->n > 8) return NVN_INDIRECT_RANGE_UNKNOWN;
+    int result = NVN_INDIRECT_RANGE_DISJOINT;
+    for (int i = 0; i <= rt->n; i++) {
+        const tex_t *target = i == rt->n ? rt->depth : rt->color[i];
+        if (!target) continue;
+        int relation = nvn_indirect_texture_relation(sampled, target);
+        if (relation == NVN_INDIRECT_RANGE_OVERLAP) return relation;
+        if (relation == NVN_INDIRECT_RANGE_UNKNOWN) result = relation;
+    }
+    return result;
+}
+typedef struct { unsigned registered, samplers, rt_overlap, rt_unknown; } indirect_preflight_counts;
+typedef struct { uintptr_t address; uint64_t size; } indirect_range;
+typedef struct {
+    indirect_range sampled[32], targets[9];
+    unsigned nsampled, ntargets;
+} indirect_range_snapshot;
+/* Caller holds the descriptor registry lock. */
+static indirect_range_snapshot indirect_capture_ranges(const nvn_indirect_texture_ids *ids, unsigned count,
+                                                       int has_rt, const p_set_rt *rt) {
+    indirect_range_snapshot snapshot = {0};
+    if (!ids || count > 32 || !has_rt || !rt || rt->n < 0 || rt->n > 8) return snapshot;
+    for (unsigned i = 0; i < count; i++) {
+        unsigned tid = ids[i].texture_id;
+        if (tid > 0 && tid < (unsigned)g_ntreg && g_treg[tid].ok &&
+            (!g_tpool_n || tid < (unsigned)g_tpool_n)) {
+            const tex_t *t = &g_treg[tid].t;
+            snapshot.sampled[snapshot.nsampled++] = (indirect_range){(uintptr_t)t->mem, t->L.size};
+        }
+    }
+    for (int i = 0; i <= rt->n; i++) {
+        const tex_t *t = i == rt->n ? rt->depth : rt->color[i];
+        if (t) snapshot.targets[snapshot.ntargets++] = (indirect_range){(uintptr_t)t->mem, t->L.size};
+    }
+    return snapshot;
+}
+typedef struct { unsigned overlap, invalid_pairs; } indirect_backing_counts;
+/* Diagnostic only: this snapshot does not reserve descriptors or mappings. */
+static indirect_backing_counts indirect_snapshot_backing_counts(const indirect_range_snapshot *snapshot) {
+    indirect_backing_counts counts = {0};
+    for (unsigned i = 0; i < snapshot->nsampled; i++) {
+        int overlap = 0;
+        for (unsigned j = 0; j < snapshot->ntargets; j++) {
+            indirect_range a = snapshot->sampled[i], b = snapshot->targets[j];
+            int relation = totk_vpool_known_overlap(a.address, a.size, b.address, b.size);
+            overlap |= relation == 1;
+            counts.invalid_pairs += relation < 0;
+        }
+        counts.overlap += overlap;
+    }
+    return counts;
+}
+/* Caller holds the descriptor registry lock. */
+static indirect_preflight_counts indirect_preflight_count(const nvn_indirect_texture_ids *ids, unsigned count,
+                                                   int has_rt, const p_set_rt *rt) {
+    indirect_preflight_counts counts = {0};
+    for (unsigned j = 0; j < count; j++) {
+        unsigned tid = ids[j].texture_id, sid = ids[j].sampler_id;
+        int valid = tid > 0 && tid < (unsigned)g_ntreg && g_treg[tid].ok && (!g_tpool_n || tid < (unsigned)g_tpool_n);
+        counts.registered += valid;
+        counts.samplers += sid > 0 && sid < (unsigned)g_nsreg && g_sreg_ok[sid];
+        int relation = valid && has_rt ? indirect_rt_relation(&g_treg[tid].t, rt) : NVN_INDIRECT_RANGE_UNKNOWN;
+        counts.rt_overlap += relation == NVN_INDIRECT_RANGE_OVERLAP;
+        counts.rt_unknown += relation == NVN_INDIRECT_RANGE_UNKNOWN;
+    }
+    return counts;
+}
+/* Caller holds the descriptor registry lock. This does not submit GPU work. */
+static int indirect_preflight_encoder_matches(NvShader *sh, const nvn_rbind *tex, const nvn_rbind *samp,
+                                              const nvn_indirect_texture_ids *ids, const uint64_t *slots) {
+    if (!sh->fn || !sh->ae || !tex->indirect_count || tex->indirect_count > 32 ||
+        sh->arg_len != sh->ae.encodedLength || sh->arg_len > NVN_REFL_MAXB * sizeof *slots ||
+        tex->aid + tex->indirect_count > sh->arg_len / sizeof *slots ||
+        samp->aid + tex->indirect_count > sh->arg_len / sizeof *slots) return 0;
+    id<MTLArgumentEncoder> encoder = [sh->fn newArgumentEncoderWithBufferIndex:sh->rf.abi];
+    if (!encoder || encoder.encodedLength != sh->arg_len) return 0;
+    id<MTLBuffer> reference = [g_dev newBufferWithLength:sh->arg_len options:MTLResourceStorageModeShared];
+    if (!reference || !reference.contents) return 0;
+    memset(reference.contents, 0, sh->arg_len);
+    [encoder setArgumentBuffer:reference offset:0];
+    for (unsigned j = 0; j < tex->indirect_count; j++) {
+        unsigned tid = ids[j].texture_id, sid = ids[j].sampler_id;
+        if (!tid || tid >= (unsigned)g_ntreg || !g_treg[tid].ok || !g_treg[tid].view ||
+            !sid || sid >= (unsigned)g_nsreg || !g_sreg_ok[sid] || !g_sview[sid]) return 0;
+        [encoder setTexture:(__bridge id<MTLTexture>)g_treg[tid].view atIndex:tex->aid + j];
+        [encoder setSamplerState:(__bridge id<MTLSamplerState>)g_sview[sid] atIndex:samp->aid + j];
+    }
+#ifdef HOGWARTS_EXPERIMENTAL
+    if (getenv("HOGWARTS_PREFLIGHT_BAD_LAYOUT") ||
+        (tex->ptr == 3 && getenv("HOGWARTS_CUBE_PREFLIGHT_BAD_LAYOUT")) ||
+        (tex->ptr == 4 && getenv("HOGWARTS_2D_ARRAY_PREFLIGHT_BAD_LAYOUT"))) {
+        uint64_t *encoded = reference.contents;
+        encoded[tex->aid] ^= 1;
+    }
+#endif
+    const uint64_t *encoded = reference.contents;
+    for (unsigned j = 0; j < tex->indirect_count; j++)
+        if (encoded[tex->aid + j] != slots[tex->aid + j] ||
+            encoded[samp->aid + j] != slots[samp->aid + j]) return 0;
+    return 1;
+}
+#ifdef HOGWARTS_EXPERIMENTAL
+/* Caller holds the descriptor registry lock. This compares only scalar slots. */
+static int scalar_preflight_encoder_matches(NvShader *sh, const nvn_indirect_scalar_binding *bindings,
+                                             unsigned count, const uint64_t *slots) {
+    if (!sh->fn || !sh->ae || sh->arg_len != sh->ae.encodedLength ||
+        sh->arg_len > NVN_REFL_MAXB * sizeof *slots || sh->arg_len % sizeof *slots) return 0;
+    id<MTLArgumentEncoder> encoder = [sh->fn newArgumentEncoderWithBufferIndex:sh->rf.abi];
+    if (!encoder || encoder.encodedLength != sh->arg_len) return 0;
+    id<MTLBuffer> reference = [g_dev newBufferWithLength:sh->arg_len options:MTLResourceStorageModeShared];
+    if (!reference || !reference.contents) return 0;
+    memset(reference.contents, 0, sh->arg_len);
+    [encoder setArgumentBuffer:reference offset:0];
+    for (unsigned i = 0; i < count; i++) {
+        unsigned tid = bindings[i].ids.texture_id, sid = bindings[i].ids.sampler_id;
+        if (bindings[i].texture_slot >= sh->arg_len / sizeof *slots ||
+            bindings[i].sampler_slot >= sh->arg_len / sizeof *slots ||
+            !tid || tid >= (unsigned)g_ntreg || !g_treg[tid].ok || !g_treg[tid].view ||
+            !sid || sid >= (unsigned)g_nsreg || !g_sreg_ok[sid] || !g_sview[sid]) return 0;
+        [encoder setTexture:(__bridge id<MTLTexture>)g_treg[tid].view atIndex:bindings[i].texture_slot];
+        [encoder setSamplerState:(__bridge id<MTLSamplerState>)g_sview[sid] atIndex:bindings[i].sampler_slot];
+    }
+    if (getenv("HOGWARTS_SCALAR_PREFLIGHT_BAD_LAYOUT"))
+        ((uint64_t *)reference.contents)[bindings[0].texture_slot] ^= 1;
+    const uint64_t *encoded = reference.contents;
+    for (unsigned i = 0; i < count; i++)
+        if (encoded[bindings[i].texture_slot] != slots[bindings[i].texture_slot] ||
+            encoded[bindings[i].sampler_slot] != slots[bindings[i].sampler_slot]) return 0;
+    return 1;
+}
+#endif
+static int prepare_draw_textures(NvProg *pr) {
+    if (!pr) return 1;
+    for (int st = 0; st < 5; st++) {
+        NvShader *sh = pr->sh[st];
+        if (!sh || !shader_has_indirect_textures(sh)) continue;
+        if (!hogwarts_indirect_diagnostic()) MDIE("indirect texture preflight not enabled");
+#ifdef HOGWARTS_EXPERIMENTAL
+        unsigned scalar_count = 0, available = 0, resolved = 0;
+        nvn_indirect_scalar_binding scalar_bindings[64];
+        const char *scalar_dry = getenv("HOGWARTS_SKIP_INDIRECT_DRY_RUN");
+        for (int i = 0; i < sh->rf.nb; i++) {
+            const nvn_rbind *b = &sh->rf.b[i];
+            if (b->kind != NVN_RB_ITEX || (b->ptr != 3 && b->ptr != 4)) continue;
+            const char *label = b->ptr == 3 ? "cube" : "2D array";
+            if (!scalar_dry || strcmp(scalar_dry, "1") || !nogpu())
+                MDIE("%s indirect diagnostic requires no-commit dry run", label);
+            if (st >= 6 || b->reg >= 16 || b->off >= 128)
+                MDIE("%s indirect diagnostic: invalid binding", label);
+            nvn_indirect_texture_ids ids[32];
+            int snapshot = indirect_uniform_snapshot(&S.ubo[st][b->reg], b->indirect_count,
+                                                     (uint32_t)S.samp[st][b->off], ids);
+            if (getenv(b->ptr == 3 ? "HOGWARTS_CUBE_PREFLIGHT_ARGS" : "HOGWARTS_2D_ARRAY_PREFLIGHT_ARGS")) {
+                if (!snapshot) MDIE("%s indirect preflight: coherent snapshot unavailable", label);
+                const nvn_rbind *sampler = NULL;
+                for (int j = 0; j < sh->rf.nb; j++) {
+                    const nvn_rbind *candidate = &sh->rf.b[j];
+                    if (candidate->kind == NVN_RB_ISAMP && candidate->ptr == b->ptr &&
+                        candidate->aid == b->pair_aid) {
+                        if (sampler) MDIE("%s indirect preflight: ambiguous sampler", label);
+                        sampler = candidate;
+                    }
+                }
+                if (!sampler || sampler->pair_aid != b->aid || sampler->reg != b->reg ||
+                    sampler->off != b->off || sampler->indirect_count != b->indirect_count ||
+                    sampler->arr != b->arr ||
+                    sh->arg_len > NVN_REFL_MAXB * sizeof(uint64_t) ||
+                    sh->arg_len % sizeof(uint64_t))
+                    MDIE("%s indirect preflight: invalid pair or argument range", label);
+                uint64_t slots[NVN_REFL_MAXB] = {0};
+                NvIndirectLease *lease = [NvIndirectLease new];
+                unsigned failed = 0;
+                g_tex_prepare_split = 0; g_tex_preparing = 1;
+                registry_lock();
+                int result = nvn_indirect_texture_bind_ids(ids, b->indirect_count, slots,
+                    sh->arg_len / sizeof *slots, b->aid, sampler->aid,
+                    b->ptr == 3 ? indirect_resolve_registered_cube : indirect_resolve_registered_2d,
+                    (__bridge void *)lease, &failed);
+                indirect_preflight_counts counts = indirect_preflight_count(ids, b->indirect_count, R.has_rt, &R.rt);
+                int matches = result == NVN_INDIRECT_OK &&
+                    indirect_preflight_encoder_matches(sh, b, sampler, ids, slots);
+                if (result != NVN_INDIRECT_OK && failed < b->indirect_count) {
+                    unsigned tid = ids[failed].texture_id, sid = ids[failed].sampler_id;
+                    id<MTLTexture> view = tid > 0 && tid < (unsigned)g_ntreg ?
+                        (__bridge id<MTLTexture>)g_treg[tid].view : nil;
+                    MLOG("%s indirect preflight: unresolved index=%u texture=%u sampler=%u type=%lu format=%lu split=%d",
+                         label, failed, tid, sid, (unsigned long)view.textureType, (unsigned long)view.pixelFormat, g_tex_prepare_split);
+                }
+                registry_unlock(); g_tex_preparing = 0;
+                [lease releasePins];
+                if (g_tex_prepare_split) { g_tex_prepare_split = 0; rp_end(); }
+                if (result != NVN_INDIRECT_OK || !matches)
+                    MDIE("%s indirect preflight: result=%d failed=%u encoder_matches=%d", label, result, failed, matches);
+                static unsigned captured[2];
+                unsigned *counter = &captured[b->ptr == 4];
+                if (++*counter <= 8 || *counter % 1000 == 0)
+                    MLOG("%s indirect preflight: count=%u encoder_matches=1 rt_overlap=%u rt_unknown=%u; not submitted",
+                         label, b->indirect_count, counts.rt_overlap, counts.rt_unknown);
+            }
+            static unsigned skipped[2];
+            unsigned *counter = &skipped[b->ptr == 4];
+            if (++*counter <= 8 || *counter % 1000 == 0)
+                MLOG("%s indirect dry run: skipped draw %u stage=%d count=%u snapshot=%d; output invalid",
+                     label, *counter, st, b->indirect_count, snapshot);
+            return 0;
+        }
+        for (int i = 0; i < sh->rf.nb; i++) {
+            const nvn_rbind *b = &sh->rf.b[i];
+            if (b->kind != NVN_RB_SCALAR_ITEX) continue;
+            if (!scalar_dry || strcmp(scalar_dry, "1") || !nogpu())
+                MDIE("scalar indirect diagnostic requires no-commit dry run");
+            if (st >= 6 || b->reg >= 16 || b->indirect_count >= 128 || (b->ptr != 1 && b->ptr != 2))
+                MDIE("scalar indirect diagnostic: invalid binding");
+            uint32_t direct = (uint32_t)S.samp[st][b->indirect_count];
+            nvn_indirect_texture_ids ids;
+            if (scalar_count >= 64) MDIE("scalar indirect diagnostic: too many pairs");
+            unsigned index = scalar_count;
+            scalar_count++;
+            if (indirect_uniform_snapshot_at(&S.ubo[st][b->reg], b->off, 1, direct, &ids)) {
+                scalar_bindings[index] = (nvn_indirect_scalar_binding){ids, b->aid, b->pair_aid};
+                available++;
+                NvIndirectLease *lease = [NvIndirectLease new];
+                uint64_t texture, sampler;
+                g_tex_prepare_split = 0; g_tex_preparing = 1;
+                registry_lock();
+                int ok = indirect_resolve_registered_type((__bridge void *)lease, ids, &texture, &sampler, MTLTextureType2D);
+                resolved += ok;
+                if (!ok) {
+                    static unsigned logged_scalar_failure;
+                    if (logged_scalar_failure++ < 12) {
+                        int texture_registered = ids.texture_id > 0 && ids.texture_id < (unsigned)g_ntreg &&
+                            g_treg[ids.texture_id].ok;
+                        int sampler_registered = ids.sampler_id > 0 && ids.sampler_id < (unsigned)g_nsreg &&
+                            g_sreg_ok[ids.sampler_id];
+                        id<MTLTexture> view = texture_registered ? (__bridge id<MTLTexture>)g_treg[ids.texture_id].view : nil;
+                        MLOG("scalar indirect diagnostic: texture=%u registered=%d type=%lu format=%lu sampler=%u registered=%d split=%d",
+                             ids.texture_id, texture_registered, (unsigned long)view.textureType,
+                             (unsigned long)view.pixelFormat, ids.sampler_id, sampler_registered, g_tex_prepare_split);
+                    }
+                }
+                registry_unlock(); g_tex_preparing = 0;
+                [lease releasePins];
+                if (g_tex_prepare_split) { g_tex_prepare_split = 0; rp_end(); }
+            } else {
+                static unsigned logged_scalar_snapshot_failure;
+                if (logged_scalar_snapshot_failure++ < 8)
+                    MLOG("scalar indirect diagnostic: unavailable snapshot stage=%d uniform=%u offset=%u size=%llu source=%u",
+                         st, b->reg, b->off, (unsigned long long)S.ubo[st][b->reg].size, b->ptr);
+            }
+        }
+        if (scalar_count) {
+            if (getenv("HOGWARTS_SCALAR_PREFLIGHT_ARGS")) {
+                uint64_t slots[NVN_REFL_MAXB] = {0};
+                if (available != scalar_count || sh->arg_len > sizeof slots || sh->arg_len % sizeof *slots)
+                    MDIE("scalar indirect argument preflight: incomplete snapshots or invalid argument length");
+                NvIndirectLease *lease = [NvIndirectLease new];
+                unsigned failed = 0;
+                g_tex_prepare_split = 0; g_tex_preparing = 1;
+                registry_lock();
+                int result = nvn_indirect_scalar_bind_ids(scalar_bindings, scalar_count, slots,
+                    sh->arg_len / sizeof *slots, indirect_resolve_registered_2d, (__bridge void *)lease, &failed);
+                int matches = result == NVN_INDIRECT_OK &&
+                    scalar_preflight_encoder_matches(sh, scalar_bindings, scalar_count, slots);
+                registry_unlock(); g_tex_preparing = 0;
+                [lease releasePins];
+                if (g_tex_prepare_split) { g_tex_prepare_split = 0; rp_end(); }
+                if (result != NVN_INDIRECT_OK || !matches)
+                    MDIE("scalar indirect argument preflight: result=%d failed=%u encoder_matches=%d",
+                         result, failed, matches);
+                static unsigned captured_scalar;
+                if (++captured_scalar <= 8 || captured_scalar % 1000 == 0)
+                    MLOG("scalar indirect argument preflight: pairs=%u encoder_matches=1; not submitted", scalar_count);
+            }
+            static unsigned skipped_scalar;
+            if (++skipped_scalar <= 8 || skipped_scalar % 1000 == 0)
+                MLOG("scalar indirect dry run: skipped draw %u stage=%d pairs=%u snapshots=%u resolved=%u; output invalid",
+                     skipped_scalar, st, scalar_count, available, resolved);
+            return 0;
+        }
+#endif
+        for (int i = 0; i < sh->rf.nb; i++) {
+            const nvn_rbind *b = &sh->rf.b[i];
+            if (b->kind != NVN_RB_ITEX) continue;
+            if (st >= 6 || b->reg >= 16 || b->off >= 128)
+                MDIE("indirect texture preflight: invalid stage or slots");
+            nvn_indirect_texture_ids ids[32];
+            const p_bind_buf *u = &S.ubo[st][b->reg];
+            const nvn_rbind *sampler = NULL;
+            for (int j = 0; j < sh->rf.nb; j++) {
+                const nvn_rbind *candidate = &sh->rf.b[j];
+                if (candidate->kind == NVN_RB_ISAMP && candidate->reg == b->reg &&
+                    candidate->off == b->off && candidate->indirect_count == b->indirect_count) {
+                    if (sampler) MDIE("indirect texture preflight: ambiguous sampler array");
+                    sampler = candidate;
+                }
+            }
+            if (!sampler) MDIE("indirect texture preflight: missing sampler array");
+            unsigned failed = 0; int result;
+            indirect_preflight_counts counts = {0};
+            indirect_range_snapshot ranges = {0};
+            int encoder_matches = 0;
+            uint64_t slots[NVN_REFL_MAXB] = {0};
+            for (int attempt = 0;; attempt++) {
+                g_tex_prepare_split = 0; g_tex_preparing = 1;
+                registry_lock();
+                result = indirect_build_snapshot_slots_with_ids(u, (uint32_t)S.samp[st][b->off], b, sampler,
+                                                                slots, NVN_REFL_MAXB, &failed, ids);
+                if (result == NVN_INDIRECT_OK || result == NVN_INDIRECT_RESOURCE_UNAVAILABLE)
+                    counts = indirect_preflight_count(ids, b->indirect_count, R.has_rt, &R.rt);
+                if (result == NVN_INDIRECT_OK || result == NVN_INDIRECT_RESOURCE_UNAVAILABLE)
+                    ranges = indirect_capture_ranges(ids, b->indirect_count, R.has_rt, &R.rt);
+                if (result == NVN_INDIRECT_OK && !g_tex_prepare_split)
+                    encoder_matches = indirect_preflight_encoder_matches(sh, b, sampler, ids, slots);
+                registry_unlock(); g_tex_preparing = 0;
+                if (result == NVN_INDIRECT_SNAPSHOT_UNAVAILABLE)
+                    MDIE("indirect texture preflight: unavailable coherent snapshot stage=%d uniform=%u sampler=%u count=%u size=%llu",
+                         st, b->reg, b->off, b->indirect_count, (unsigned long long)u->size);
+                if (!g_tex_prepare_split) break;
+                if (attempt >= 1) MDIE("indirect texture preflight: resource preparation repeatedly requested pass split");
+                g_tex_prepare_split = 0; rp_end();
+            }
+            if (result == NVN_INDIRECT_RESOURCE_UNAVAILABLE && failed < b->indirect_count) {
+                unsigned tid = ids[failed].texture_id, sid = ids[failed].sampler_id;
+                registry_lock();
+                id<MTLTexture> tex = tid > 0 && tid < (unsigned)g_ntreg ? (__bridge id<MTLTexture>)g_treg[tid].view : nil;
+                id<MTLTexture> base = tex;
+                while (base.parentTexture) base = base.parentTexture;
+                id<MTLResource> allocation = base.buffer ? (id<MTLResource>)base.buffer : (id<MTLResource>)base;
+                pthread_mutex_lock(&g_res_mu);
+                int resident = allocation && [g_res_objects containsObject:allocation];
+                pthread_mutex_unlock(&g_res_mu);
+                int custom_border = sid > 0 && sid < (unsigned)g_nsreg && g_sreg_ok[sid] && samp_border_custom(&g_sreg[sid]);
+                MLOG("indirect texture preflight: failed resource view=%d type=%lu format=%lu resident=%d custom_border=%d",
+                     tex != nil, (unsigned long)tex.textureType, (unsigned long)tex.pixelFormat, resident, custom_border);
+                registry_unlock();
+            }
+            if (result == NVN_INDIRECT_OK && !encoder_matches)
+                MDIE("indirect texture preflight: Metal argument encoder mismatch or unavailable");
+#ifdef HOGWARTS_EXPERIMENTAL
+            if (getenv("HOGWARTS_PREFLIGHT_FULL_ARGS") && result == NVN_INDIRECT_OK) {
+                if (!nogpu()) MDIE("indirect argument capture requires GPU submission disabled");
+                for (int j = 0; j < sh->rf.nb; j++) {
+                    const nvn_rbind *binding = &sh->rf.b[j];
+                    if (binding->rw || (binding->kind != NVN_RB_SUPPORT && binding->kind != NVN_RB_CBUF &&
+                        binding->kind != NVN_RB_C1 && binding->kind != NVN_RB_SBUFP &&
+                        binding->kind != NVN_RB_TEX && binding->kind != NVN_RB_SAMP &&
+                        binding->kind != NVN_RB_TBUF && binding->kind != NVN_RB_ITEX &&
+                        binding->kind != NVN_RB_ISAMP))
+                        MDIE("indirect argument capture: unsupported binding kind %d", binding->kind);
+                }
+                indirect_argument_capture captured = {0};
+                const nvn_rbind *missing_test = NULL;
+                const nvn_rbind *range_test = NULL;
+                uint64_t saved_texture = 0;
+                uint64_t saved_uniform_size = 0;
+                if (getenv("HOGWARTS_PREFLIGHT_TEST_MISSING_TBUF")) {
+                    for (int j = 0; j < sh->rf.nb; j++)
+                        if (sh->rf.b[j].kind == NVN_RB_TBUF && sh->rf.b[j].reg < 128) {
+                            missing_test = &sh->rf.b[j]; break;
+                        }
+                    if (!missing_test) MDIE("indirect argument capture: no typed buffer for missing-binding test");
+                    saved_texture = S.tex[st][missing_test->reg];
+                    S.tex[st][missing_test->reg] = 0;
+                }
+                if (getenv("HOGWARTS_PREFLIGHT_TEST_BAD_CBUF_RANGE")) {
+                    for (int j = 0; j < sh->rf.nb; j++)
+                        if (sh->rf.b[j].kind == NVN_RB_CBUF && sh->rf.b[j].reg < 16 &&
+                            sh->rf.b[j].reg != b->reg && S.ubo[st][sh->rf.b[j].reg].addr) {
+                            range_test = &sh->rf.b[j]; break;
+                        }
+                    if (!range_test) MDIE("indirect argument capture: no direct uniform for range test");
+                    saved_uniform_size = S.ubo[st][range_test->reg].size;
+                    S.ubo[st][range_test->reg].size = 0;
+                }
+                if (!encode_args_impl(nil, sh, st, 0, 1, &captured))
+                    MDIE("indirect argument capture: production builder rejected resources");
+                if (missing_test) {
+                    S.tex[st][missing_test->reg] = saved_texture;
+                    if (captured.issue[missing_test->aid] != INDIRECT_BINDING_FALLBACK)
+                        MDIE("indirect argument capture: missing typed buffer not detected");
+                }
+                if (range_test) {
+                    S.ubo[st][range_test->reg].size = saved_uniform_size;
+                    if (captured.issue[range_test->aid] != INDIRECT_BINDING_INVALID_RANGE)
+                        MDIE("indirect argument capture: invalid uniform range not detected");
+                }
+                if (getenv("HOGWARTS_PREFLIGHT_BAD_FULL_ARGS")) captured.slots[b->aid] ^= 1;
+                for (unsigned j = 0; j < b->indirect_count; j++)
+                    if (captured.slots[b->aid + j] != slots[b->aid + j] ||
+                        captured.slots[sampler->aid + j] != slots[sampler->aid + j])
+                        MDIE("indirect argument capture: indirect slots changed or mismatched");
+                unsigned nonzero = 0, fallbacks = 0, invalid_ranges = 0;
+                for (int j = 0; j < sh->rf.nb; j++) {
+                    const nvn_rbind *binding = &sh->rf.b[j];
+                    if (binding->kind != NVN_RB_ITEX && binding->kind != NVN_RB_ISAMP) {
+                        nonzero += captured.slots[binding->aid] != 0;
+                        if (captured.issue[binding->aid] != INDIRECT_BINDING_OK) {
+                            fallbacks += captured.issue[binding->aid] == INDIRECT_BINDING_FALLBACK;
+                            invalid_ranges += captured.issue[binding->aid] == INDIRECT_BINDING_INVALID_RANGE;
+                            MLOG("indirect argument capture: %s kind=%d reg=%u slot=%u",
+                                 captured.issue[binding->aid] == INDIRECT_BINDING_FALLBACK ? "fallback" : "invalid range",
+                                 binding->kind, binding->reg, binding->aid);
+                        }
+                    }
+                }
+                MLOG("indirect argument capture: stage=%d reflected_bindings=%d indirect_slots=%u matched=1 other_nonzero=%u fallbacks=%u invalid_ranges=%u gpu_submission=disabled; no draw issued",
+                     st, sh->rf.nb, 2 * b->indirect_count, nonzero, fallbacks, invalid_ranges);
+            }
+#endif
+            unsigned rt_colors = 0;
+            if (R.has_rt && R.rt.n >= 0 && R.rt.n <= 8)
+                for (int j = 0; j < R.rt.n; j++) rt_colors += R.rt.color[j] != NULL;
+            indirect_backing_counts backing = indirect_snapshot_backing_counts(&ranges);
+            MLOG("indirect texture backing snapshot: sampled=%u targets=%u known_overlap=%u invalid_pairs=%u; "
+                 "unknown is not disjoint and mappings are not reserved",
+                 ranges.nsampled, ranges.ntargets, backing.overlap, backing.invalid_pairs);
+#ifdef HOGWARTS_EXPERIMENTAL
+            const char *dry = getenv("HOGWARTS_SKIP_INDIRECT_DRY_RUN");
+            if (dry && !strcmp(dry, "1")) {
+                if (!nogpu()) MDIE("indirect dry run requires GPU submission disabled");
+                if (result != NVN_INDIRECT_OK || !encoder_matches)
+                    MDIE("indirect dry run: resource preflight failed result=%d index=%u", result, failed);
+                static unsigned skipped;
+                if (++skipped <= 8 || skipped % 1000 == 0)
+                    MLOG("indirect dry run: skipped draw %u; GPU submission disabled, output invalid", skipped);
+                return 0;
+            }
+#endif
+            MDIE("indirect texture preflight: stage=%d count=%u registered_textures=%u registered_samplers=%u resolver=%d failed_index=%u encoder_matches=%d rt_set=%d rt_colors=%u rt_depth=%d rt_overlap=%u rt_unknown=%u gpu_submission=%s; draw intentionally blocked pending hazards",
+                 st, b->indirect_count, counts.registered, counts.samplers, result, failed, encoder_matches, R.has_rt, rt_colors,
+                 R.has_rt && R.rt.depth != NULL, counts.rt_overlap, counts.rt_unknown, nogpu() ? "disabled" : "enabled");
+        }
+        MDIE("indirect texture preflight: missing texture array");
+    }
     int planned = texture_plan_on();
     if (planned) {
         unsigned total = 0;
@@ -9544,7 +10303,7 @@ static void prepare_draw_textures(NvProg *pr) {
             }
             total += sh->texture_count; g_texture_plan_total += sh->rf.nb; g_texture_plan_selected += sh->texture_count;
         }
-        if (!total) return;
+        if (!total) return 1;
     }
     for (;;) {
         g_tex_prepare_split = 0; g_tex_preparing = 1;
@@ -9563,7 +10322,7 @@ static void prepare_draw_textures(NvProg *pr) {
             if (g_tex_prepare_split) break;
         }
         registry_unlock(); g_tex_preparing = 0;
-        if (!g_tex_prepare_split) return;
+        if (!g_tex_prepare_split) return 1;
         /* rp_end may flush deferred draws which also use the registry. */
         g_tex_prepare_split = 0; rp_end();
     }
@@ -10125,8 +10884,91 @@ static int mfxup_draw(NvProg *pr) {
     return 0;
 }
 #include "nvn_cube_group.h"
+#ifdef HOGWARTS_EXPERIMENTAL
+#include "../../../../../hogwarts/runtime/geometry_strip.h"
+static void hogwarts_capture_geometry(const prog_t *program, const p_draw *dw, const p_draw_idx *di) {
+    const char *path = getenv("HOGWARTS_GEOMETRY_CAPTURE");
+    if (!path) return;
+    static int captured;
+    if (captured) return;
+    if (!nogpu() || path[0] != '/') MDIE("geometry capture requires no-commit and an absolute output path");
+    NSMutableArray *stages = [NSMutableArray array];
+    unsigned seen = 0;
+    for (unsigned i = 0; i < program->nstage; i++) {
+        const uint8_t *ctl = program->sd[i].control;
+        const uint8_t *code = (const uint8_t *)(uintptr_t)program->sd[i].data;
+        if (!ctl || !code) MDIE("geometry capture: missing stage data");
+        uint32_t stage, length, c1;
+        memcpy(&stage, ctl + 0x714, 4); memcpy(&length, ctl + 0x704, 4);
+        memcpy(&c1, ctl + 0x700, 4);
+        if (stage > 5 || !length || length > 16u * 1024 * 1024 || c1 > length ||
+            (stage != 5 && (length < 0x30 || c1 < 0x30)) || (seen & (1u << stage)))
+            MDIE("geometry capture: invalid or duplicate stage %u", stage);
+        seen |= 1u << stage;
+        [stages addObject:@{@"stage": @(stage), @"constant_offset": @(c1),
+            @"control": [NSData dataWithBytes:ctl length:ctl_key_len(ctl)],
+            @"code": [NSData dataWithBytes:code length:length]}];
+    }
+    if ((seen & 5u) != 5u || (!!dw == !!di))
+        MDIE("geometry capture: missing vertex/geometry stage or draw");
+    if (dw && dw->prim == NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP && dw->count >= 3 && dw->count <= 65536) {
+        size_t capacity = ((size_t)dw->count - 2) * 3, written = 0;
+        uint32_t *remap = malloc(capacity * sizeof *remap);
+        if (!remap) MDIE("geometry capture: cannot allocate strip remap");
+        if (!hogwarts_geometry_strip_remap((uint32_t)dw->count, 0, remap, capacity, &written)) {
+            free(remap);
+            MDIE("geometry capture: strip remap failed");
+        }
+        MLOG("geometry capture: validated non-indexed strip remap: %zu triangles, %d instances; no replay",
+             written / 3, dw->instances);
+        free(remap);
+    }
+    NSDictionary *capture = @{@"version": @1, @"primitive": @(dw ? dw->prim : di->prim),
+        @"indexed": @((BOOL)(di != NULL)), @"count": @(dw ? dw->count : di->count),
+        @"instances": @(dw ? dw->instances : di->instances), @"stages": stages};
+    NSError *error = nil;
+    NSData *encoded = [NSPropertyListSerialization dataWithPropertyList:capture
+        format:NSPropertyListBinaryFormat_v1_0 options:0 error:&error];
+    if (!encoded) MDIE("geometry capture: cannot serialize: %s", error.localizedDescription.UTF8String);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (fd < 0) MDIE("geometry capture: cannot create output: %s", strerror(errno));
+    const uint8_t *bytes = encoded.bytes; size_t remaining = encoded.length;
+    while (remaining) {
+        ssize_t written = write(fd, bytes, remaining);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) { int err = errno; close(fd); MDIE("geometry capture: write failed: %s", strerror(err)); }
+        bytes += written; remaining -= (size_t)written;
+    }
+    if (close(fd)) MDIE("geometry capture: close failed: %s", strerror(errno));
+    captured = 1;
+    MLOG("geometry capture: saved vertex and geometry stages; no game GPU work submitted");
+}
+#endif
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
+#ifdef HOGWARTS_EXPERIMENTAL
+    const char *dry_stages = getenv("HOGWARTS_SKIP_UNSUPPORTED_STAGES_DRY_RUN");
+    if (dry_stages && !strcmp(dry_stages, "1")) {
+        if (!nogpu()) MDIE("unsupported-stage dry run requires GPU submission disabled");
+        if (S.prog->nstage > 6) MDIE("unsupported-stage dry run: invalid stage count %u", S.prog->nstage);
+        for (unsigned i = 0; i < S.prog->nstage; i++) {
+            const uint8_t *control = S.prog->sd[i].control;
+            if (!control || !S.prog->sd[i].data) MDIE("unsupported-stage dry run: null shader binary");
+            uint32_t stage, length;
+            memcpy(&stage, control + 0x714, 4); memcpy(&length, control + 0x704, 4);
+            if (!length || length > 16 * 1024 * 1024) MDIE("unsupported-stage dry run: invalid code length %u", length);
+            if (stage >= 2 && stage <= 4) {
+                if (stage == 2) hogwarts_capture_geometry(S.prog, dw, di);
+                char key[65]; shader_key(control, (const void *)(uintptr_t)S.prog->sd[i].data, length, key);
+                static unsigned skipped;
+                if (++skipped <= 8 || skipped % 1000 == 0)
+                    MLOG("unsupported-stage dry run: skipped draw %u stage=%u shader=%s; output invalid", skipped, stage, key);
+                g_draw_skip[15]++;
+                return;
+            }
+        }
+    }
+#endif
     int must_wait = rt_small();
     totk_rt_set_async_allowed(!must_wait);
     g_draw_may_skip = !must_wait;
@@ -10154,7 +10996,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     geometry_dump(pr, dw, di);
     if (di && di->itype == 0 && di->count && pend_hits(di->ibuf, (uint64_t)di->count)) widen_indices_gpu(di);
     /* Merge/skip checks can resolve sampling views too; prepare before any of those checks. */
-    if (!S.render_disabled && !S.raster_discard) { prepare_draw_textures(pr); if (mfxup_draw(pr)) return; }   // docked: MetalFX wrote the canvas instead of this draw
+    if (!S.render_disabled && !S.raster_discard) { if (!prepare_draw_textures(pr)) return; if (mfxup_draw(pr)) return; }   // docked: MetalFX wrote the canvas instead of this draw
     if (g_ruler_truth == 0) {   // 尺子负对照（DM_NVN_RULER_NEG=<片元键>）：被测模式下丢掉该着色器的绘制，尺子必须报不等价 | Ruler negative control (DM_NVN_RULER_NEG=<fragment key>): in the mode under test drop this shader's draws, and the ruler must report non-equivalence
         static const char *neg; static int ng = -1; if (ng < 0) { neg = getenv("DM_NVN_RULER_NEG"); ng = neg && *neg; }
         if (ng && pr) for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (sh && sh->stage == 1 && !strncmp(sh->key, neg, strlen(neg))) { static int once; if (!once++) MLOG("DM_NVN_RULER_NEG：被测模式丢弃着色器 %s 的绘制", sh->key); return; } }
@@ -13781,15 +14623,167 @@ static int usp_expect(const uint8_t *o, uint64_t n, uint8_t v, const char *what)
 static void usnap_wait_copies(void) { while (atomic_load_explicit(&g_ush_busy, memory_order_acquire)) sched_yield(); }
 #define mtl_sub_snapshot_ubos(h, n) (mtl_sub_snapshot_ubos(h, n), usnap_wait_copies())
 #define mtl_sub_snapshot_ubos_cap(h, n, c) (mtl_sub_snapshot_ubos_cap(h, n, c), usnap_wait_copies())
+static void indirect_registry_sample(uint64_t slots[4], id<MTLTexture> tex, float expected);
 int mtl_probe_ubo_snapshot(void) {
     mtl_init();
     const char *ne = getenv("TOTK_PROBE_NEGATIVE"); int neg = ne ? atoi(ne) : 0, checked = 0;
+    if (!neg) {
+        NvShader *direct = [NvShader new], *indirect = [NvShader new];
+        direct->rf.nb = indirect->rf.nb = 1;
+        direct->rf.b[0].kind = NVN_RB_TEX;
+        indirect->rf.b[0].kind = NVN_RB_ITEX;
+        indirect->rf.has_indirect_textures = 1;
+        if (shader_has_indirect_textures(direct) || !arg_epoch_safe(direct) ||
+            !shader_has_indirect_textures(indirect) || arg_epoch_safe(indirect))
+            MDIE("indirect snapshot: argument reuse classification failed");
+        checked += 4;
+        NvProg *program = [NvProg new];
+        direct->stage = 0; indirect->stage = 1;
+        program->sh[0] = direct; program->sh[1] = indirect;
+        prog_t p = {0}; p.serial = 0xfffed201;
+        serial_put(p.serial, program);
+        uint64_t textures[6][128] = {{0}}, images[6][32] = {{0}};
+        p_set_rt rt = {0};
+        pool_t physical = {0}, virtual_pool = {.flags = NVN_MEMORY_POOL_FLAGS_VIRTUAL};
+        tex_t sampled = {.mem = (uint8_t *)(uintptr_t)0x1000, .serial = 1, .pool = &physical};
+        tex_t color = {.mem = (uint8_t *)(uintptr_t)0x2000, .serial = 2, .pool = &physical};
+        tex_t depth = {.mem = (uint8_t *)(uintptr_t)0x3000, .serial = 3, .pool = &physical};
+        sampled.L.size = color.L.size = depth.L.size = 0x100;
+        p_set_rt ranges = {.n = 1, .color = {&color}, .depth = &depth};
+        if (indirect_rt_relation(&sampled, &ranges) != NVN_INDIRECT_RANGE_UNKNOWN)
+            MDIE("indirect hazard probe: guest disjointness treated as physical proof");
+        color.pool = &virtual_pool;
+        if (indirect_rt_relation(&sampled, &ranges) != NVN_INDIRECT_RANGE_UNKNOWN)
+            MDIE("indirect hazard probe: virtual alias treated as disjoint");
+        depth.mem = (uint8_t *)(uintptr_t)0x1080;
+        if (indirect_rt_relation(&sampled, &ranges) != NVN_INDIRECT_RANGE_OVERLAP)
+            MDIE("indirect hazard probe: depth overlap hidden by unknown color");
+        depth.mem = (uint8_t *)(uintptr_t)0x3000; depth.serial = 1;
+        if (indirect_rt_relation(&sampled, &ranges) != NVN_INDIRECT_RANGE_OVERLAP)
+            MDIE("indirect hazard probe: same serial not recognized");
+        color.pool = NULL; depth.serial = 3;
+        if (indirect_rt_relation(&sampled, &ranges) != NVN_INDIRECT_RANGE_UNKNOWN)
+            MDIE("indirect hazard probe: missing pool treated as disjoint");
+        ranges.n = 9;
+        if (indirect_rt_relation(&sampled, &ranges) != NVN_INDIRECT_RANGE_UNKNOWN)
+            MDIE("indirect hazard probe: invalid target count accepted");
+        checked += 6;
+        ranges.n = 1; color.pool = &physical;
+        nvn_indirect_texture_ids hazard_ids[] = {{71, 73}};
+        samp_par hazard_sampler = {.lod_max = 16, .aniso = 1};
+        mtl_reg_samp(73, &hazard_sampler); mtl_reg_tex(71, &sampled, NULL);
+        registry_lock();
+        indirect_preflight_counts hazard_counts = indirect_preflight_count(hazard_ids, 1, 1, &ranges);
+        indirect_range_snapshot hazard_snapshot = indirect_capture_ranges(hazard_ids, 1, 1, &ranges);
+        registry_unlock();
+        if (hazard_counts.registered != 1 || hazard_counts.samplers != 1 || hazard_counts.rt_overlap || hazard_counts.rt_unknown != 1)
+            MDIE("indirect hazard probe: initial descriptor classification failed");
+        indirect_backing_counts backing_counts = indirect_snapshot_backing_counts(&hazard_snapshot);
+        if (hazard_snapshot.nsampled != 1 || hazard_snapshot.ntargets != 2 ||
+            backing_counts.overlap || backing_counts.invalid_pairs)
+            MDIE("indirect hazard probe: initial range snapshot failed");
+        sampled.mem = (uint8_t *)(uintptr_t)0x2080;
+        if (!getenv("TOTK_PROBE_INDIRECT_STALE_DESCRIPTOR")) mtl_reg_tex(71, &sampled, NULL);
+        registry_lock();
+        hazard_counts = indirect_preflight_count(hazard_ids, 1, 1, &ranges);
+        hazard_snapshot = indirect_capture_ranges(hazard_ids, 1, 1, &ranges);
+        registry_unlock();
+        if (hazard_counts.registered != 1 || hazard_counts.rt_overlap != 1 || hazard_counts.rt_unknown)
+            MDIE("indirect hazard probe: replaced descriptor not classified");
+        backing_counts = indirect_snapshot_backing_counts(&hazard_snapshot);
+        if (backing_counts.overlap != 1 || backing_counts.invalid_pairs)
+            MDIE("indirect hazard probe: replaced range snapshot missed overlap");
+        hazard_snapshot.targets[1].size = 0;
+        backing_counts = indirect_snapshot_backing_counts(&hazard_snapshot);
+        if (backing_counts.overlap != 1 || backing_counts.invalid_pairs != 1)
+            MDIE("indirect hazard probe: invalid range not reported");
+        sampled.pool = &virtual_pool; sampled.mem = (uint8_t *)(uintptr_t)0x1000;
+        mtl_reg_tex(71, &sampled, NULL);
+        registry_lock();
+        hazard_counts = indirect_preflight_count(hazard_ids, 1, 1, &ranges);
+        registry_unlock();
+        if (hazard_counts.rt_overlap || hazard_counts.rt_unknown != 1)
+            MDIE("indirect hazard probe: replacement alias uncertainty lost");
+        mtl_reg_tex(71, NULL, NULL);
+        registry_lock();
+        hazard_counts = indirect_preflight_count(hazard_ids, 1, 1, &ranges);
+        registry_unlock();
+        if (hazard_counts.registered || hazard_counts.rt_unknown != 1)
+            MDIE("indirect hazard probe: missing descriptor treated as safe");
+        checked += 7;
+        defer_t *deferred = calloc(1, sizeof *deferred);
+        if (!deferred) MDIE("indirect hazard probe allocation");
+        if (!draw_samples_rt(program) || !prog_samples_ser(&p, textures, images, 123) ||
+            !defer_prog_hits(&p, textures, images, &rt, 1, 1))
+            MDIE("indirect hazard probe: dynamic read not treated conservatively");
+        defer_collect_reads(deferred, &p, textures, images);
+        if (deferred->nreads != 513) MDIE("indirect hazard probe: unknown read set accepted");
+        defer_collect_reads(deferred, &p, textures, images);
+        if (deferred->nreads != 513) MDIE("indirect hazard probe: unknown read set changed");
+        indirect->rf.has_indirect_textures = 0;
+        deferred->nreads = 0;
+        if (draw_samples_rt(program) || prog_samples_ser(&p, textures, images, 123) ||
+            defer_prog_hits(&p, textures, images, &rt, 1, 1))
+            MDIE("indirect hazard probe: direct empty bindings rejected");
+        defer_collect_reads(deferred, &p, textures, images);
+        if (deferred->nreads) MDIE("indirect hazard probe: direct empty read set changed");
+        indirect->rf.has_indirect_textures = 1;
+        free(deferred);
+        uint8_t mapping[8]; id<MTLFunction> specialized = nil;
+        if (fz_p2_draw(program, NULL, NULL, mapping, &specialized))
+            MDIE("indirect hazard probe: merged pass accepted");
+        op_hdr ops[] = {{OP_DRAW, 8}, {OP_END, 8}};
+        g_sdx_ok = 1; g_sdx_nop = 0; g_pp_prog = &p; g_pp_rt = NULL;
+        sdx_walk((const uint8_t *)ops, 0);
+        if (g_sdx_ok) MDIE("indirect hazard probe: store index remained valid");
+        indirect->rf.has_indirect_textures = 0;
+        g_sdx_ok = 1; g_sdx_nop = 0;
+        sdx_walk((const uint8_t *)ops, 0);
+        if (!g_sdx_ok) MDIE("indirect hazard probe: direct shader invalidated store index");
+        if (tbdr_on()) {
+            if (g_xv_n) MDIE("indirect hazard probe: unexpected existing store ledger");
+            const prog_t *saved = S.prog;
+            S.prog = &p; indirect->rf.has_indirect_textures = 1;
+            g_xv[0] = (xv_ent){.ser = 123}; g_xv_n = 1;
+            uint64_t commands[] = {(uint64_t)(uintptr_t)ops};
+            mtl_sub_index(commands, 1);
+            if (g_sdx_ok || g_xv_n || !g_xv_block)
+                MDIE("indirect hazard probe: store ledger not invalidated");
+            program->sh[1] = nil; program->sh[5] = indirect; indirect->stage = 5;
+            ops[0].op = OP_DISPATCH;
+            g_xv[0] = (xv_ent){.ser = 123}; g_xv_n = 1;
+            mtl_sub_index(commands, 1);
+            if (g_sdx_ok || g_xv_n || !g_xv_block)
+                MDIE("indirect hazard probe: compute store ledger not invalidated");
+            S.prog = saved;
+            checked += 2;
+        }
+        g_sdx_ok = 0;
+        g_pp_prog = NULL; serial_del(p.serial);
+        checked += 12;
+    }
     g_usnap_index_negative=neg==10;
     if(g_usnap_index_negative)atomic_store(&g_usnap_index_on,1);
     atomic_store(&g_usnap_on, neg == 1 ? 0 : 1); g_usnap_drop_off = neg == 2;
     const size_t PG = 16384; uint8_t *mem = NULL;
     if (posix_memalign((void **)&mem, PG, PG) || !mem) MDIE("ubo snapshot probe memory");
     memset(mem, 0x11, PG); memset(mem + 4096, 0x66, 128); mtl_pool_add(mem, PG);
+    if (!neg) {
+        p_bind_buf u = {1, 3, (uint64_t)(uintptr_t)(mem + 4096), 128};
+        void *mb; uint64_t mo, gpu;
+        if (!mtl_gpu_addr(u.addr, 1, &mb, &mo, &gpu) ||
+            !indirect_uniform_range_matches(&u, mb, mo, gpu))
+            MDIE("indirect uniform range: valid pool rejected");
+        mtl_pool_add(mem + 4096, 64);
+        if (!mtl_gpu_addr(u.addr, 1, &mb, &mo, &gpu) ||
+            indirect_uniform_range_matches(&u, mb, mo, gpu))
+            MDIE("indirect uniform range: overlapping pool mismatch accepted");
+        u.size = 0;
+        if (indirect_uniform_range_matches(&u, mb, mo, gpu))
+            MDIE("indirect uniform range: empty binding accepted");
+        mtl_pool_del(mem + 4096);
+        checked += 3;
+    }
     NSError *e = nil;
     id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nkernel void k(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]], uint i [[thread_position_in_grid]]) { dst[i] = src[i]; }\n" options:nil error:&e];
     id<MTLComputePipelineState> ps = lib ? [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k"] error:&e] : nil;
@@ -13812,10 +14806,100 @@ int mtl_probe_ubo_snapshot(void) {
         checked += 2;
     }
     memset(mem + 256, 0x44, 96); memset(mem + 512, 0x45, 64); memset(mem + 8192, 0x55, 128);   // the game's threads, during the replay
+    if (!neg) {
+        p_bind_buf u = {1, 3, a0, 96};
+        nvn_indirect_texture_ids ids[4];
+        if (!indirect_uniform_snapshot(&u, 4, 0x00200000, ids)) MDIE("indirect snapshot: valid snapshot rejected");
+        for (int i = 0; i < 4; i++)
+            if (ids[i].texture_id != 0x11111 || ids[i].sampler_id != 0x113)
+                MDIE("indirect snapshot: stale handle at %d", i);
+        checked += 4;
+        u.size = 27;
+        if (indirect_uniform_snapshot(&u, 4, 0, ids)) MDIE("indirect snapshot: short uniform accepted");
+        u.size = 96; u.addr = UINT64_MAX - 2;
+        if (indirect_uniform_snapshot(&u, 4, 0, ids)) MDIE("indirect snapshot: overflowing address accepted");
+        u.addr = src;
+        if (indirect_uniform_snapshot(&u, 4, 0, ids)) MDIE("indirect snapshot: missing snapshot accepted");
+        u.addr = a0;
+        atomic_store(&g_usnap_on, 0);
+        if (indirect_uniform_snapshot(&u, 4, 0, ids)) MDIE("indirect snapshot: disabled snapshots accepted");
+        atomic_store(&g_usnap_on, 1);
+        const usnap_t *partial = usnap_find(a0, 28);
+        if (!partial || partial->hi == UINT64_MAX) MDIE("indirect snapshot: missing probe range");
+        u.size = partial->hi - a0 + 1;
+        if (indirect_uniform_snapshot(&u, 4, 0, ids)) MDIE("indirect snapshot: partial binding snapshot accepted");
+        checked += 5;
+    }
     uint64_t ptr = 0; pend_read(a0 + 8, &ptr, 8, 0);
     if (ptr != 0x1111111111111111ull) MDIE("ubo snapshot probe: pointer read %#llx, expected the bytes of the submit call", (unsigned long long)ptr); checked++;
     usp_read(ps, a0, 96, out, 0); usp_read(ps, a1, 64, out, 256);
+    uint8_t expected_inline[28];
+    if (!neg) {
+        uint32_t update = 0x12345678;
+        uint8_t partial = 0x9a;
+        uint32_t outside = 0xa5a5a5a5;
+        p_bind_buf u = {4, 1, a2, 128};
+        nvn_indirect_texture_ids ids[4];
+        if (!ub_rename_on()) MDIE("indirect snapshot probe: renamed updates required");
+        mtl_sub_update(&update, a2 + 8, sizeof update);
+        mtl_sub_update(&partial, a2 + 9, sizeof partial);
+        mtl_sub_update(&outside, a2 + 40, sizeof outside);
+        memset(expected_inline, 0x11, sizeof expected_inline);
+        memcpy(expected_inline + 8, &update, sizeof update);
+        expected_inline[9] = partial;
+        if (!indirect_uniform_snapshot(&u, 4, 0, ids)) MDIE("indirect snapshot: renamed updates rejected");
+        for (int i = 0; i < 4; i++) {
+            uint32_t expected;
+            memcpy(&expected, expected_inline + 8 * i, sizeof expected);
+            if (ids[i].texture_id != (expected & 0xfffff) || ids[i].sampler_id != (expected >> 20))
+                MDIE("indirect snapshot: renamed update mismatch at %d", i);
+        }
+        nvn_indirect_texture_ids scalar[1] = {{0}};
+        uint32_t scalar_expected;
+        memcpy(&scalar_expected, expected_inline + 8, sizeof scalar_expected);
+        if (!indirect_uniform_snapshot_at(&u, 8, 1, 0x00200000, scalar) ||
+            scalar[0].texture_id != (scalar_expected & 0xfffff) ||
+            scalar[0].sampler_id != ((scalar_expected | 0x00200000) >> 20))
+            MDIE("indirect snapshot: scalar offset update mismatch");
+        nvn_indirect_texture_ids scalar_before = scalar[0];
+        if (indirect_uniform_snapshot_at(&u, 125, 1, 0, scalar) ||
+            indirect_uniform_snapshot_at(&u, SIZE_MAX, 1, 0, scalar) ||
+            memcmp(scalar, &scalar_before, sizeof scalar_before))
+            MDIE("indirect snapshot: invalid scalar offset accepted");
+        if (!indirect_uniform_snapshot_at(&u, 124, 1, 0, scalar))
+            MDIE("indirect snapshot: final scalar offset rejected");
+        checked += 4;
+        nvn_indirect_texture_ids before[4]; memcpy(before, ids, sizeof before);
+        int last = g_npend - 1, saved_pend_n = g_usnap_pend_n;
+        uint8_t saved_kind = g_pend_kind[last];
+        g_pend_kind[last] = 1;
+        scalar_before = scalar[0];
+        if (indirect_uniform_snapshot(&u, 4, 0, ids) || memcmp(ids, before, sizeof before) ||
+            indirect_uniform_snapshot_at(&u, 8, 1, 0, scalar) ||
+            memcmp(scalar, &scalar_before, sizeof scalar_before))
+            MDIE("indirect snapshot: GPU copy accepted");
+        g_pend_kind[last] = saved_kind; g_usnap_pend_n = g_npend;
+        if (indirect_uniform_snapshot(&u, 4, 0, ids) || memcmp(ids, before, sizeof before) ||
+            indirect_uniform_snapshot_at(&u, 8, 1, 0, scalar) ||
+            memcmp(scalar, &scalar_before, sizeof scalar_before))
+            MDIE("indirect snapshot: earlier pending submission accepted");
+        g_usnap_pend_n = saved_pend_n;
+        uint64_t shadow = upd_shadow(a2, u.size);
+        if (!shadow) MDIE("indirect snapshot: renamed GPU binding unavailable");
+        rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+        id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL);
+        enc_c_pso(ce, ps); enc_c_args(ce, shadow, 0); enc_c_args(ce, out.gpuAddress + 768, 1);
+        [ce dispatchThreads:MTLSizeMake(sizeof expected_inline, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        enc_c_end(ce);
+        checked += 7;
+    }
     mtl_sub_copy(src, a2, 128);   // a GPU write into a copied range: later readers must see it
+    if (!neg) {
+        p_bind_buf u = {4, 1, a2, 128};
+        nvn_indirect_texture_ids ids[4];
+        if (indirect_uniform_snapshot(&u, 4, 0, ids)) MDIE("indirect snapshot: pending GPU copy accepted");
+        checked++;
+    }
     usp_read(ps, a2, 128, out, 512);
     mtl_sub_commit(); mtl_finish();
     const uint8_t *o = out.contents;
@@ -13823,7 +14907,603 @@ int mtl_probe_ubo_snapshot(void) {
     checked += usp_expect(o + 256, 64, 0x11, "read of the merged neighbour");
     checked += usp_expect(o + 512, 128, 0x66, "read after the GPU copy");
     checked += usp_expect(mem + 8192, 128, 0x66, "memory after the GPU copy");
+    if (!neg) {
+        if (memcmp(o + 768, expected_inline, sizeof expected_inline))
+            MDIE("indirect snapshot: decoded bytes differ from renamed GPU binding");
+        checked += (int)sizeof expected_inline;
+    }
     if (g_nusnap != 0) MDIE("ubo snapshot probe: copies still listed after the commit"); checked++;
+
+    if (!neg) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+        d.textureType = MTLTextureType3D; d.pixelFormat = MTLPixelFormatR32Float;
+        d.width = 2; d.height = d.depth = 1; d.storageMode = MTLStorageModeShared;
+        d.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> __attribute__((objc_precise_lifetime)) tex = [g_dev newTextureWithDescriptor:d];
+        if (!tex) MDIE("indirect snapshot binding probe: texture allocation");
+        float value = .375f, texels[] = {.25f, value};
+        [tex replaceRegion:MTLRegionMake3D(0,0,0,2,1,1) mipmapLevel:0 slice:0
+                  withBytes:texels bytesPerRow:sizeof texels bytesPerImage:sizeof texels];
+        res_add(tex);
+        id<MTLTexture> pin_test = [g_dev newTextureWithDescriptor:d];
+        if (!pin_test) MDIE("indirect residency probe: allocation failed");
+        res_add(pin_test);
+        if (!res_pin(pin_test) || !res_pin(pin_test)) MDIE("indirect residency probe: pin failed");
+        res_remove(pin_test);
+        if (res_pin(pin_test)) MDIE("indirect residency probe: retired allocation accepted");
+        res_unpin(pin_test);
+        pthread_mutex_lock(&g_res_mu);
+        int pin_test_resident = [g_res_objects containsObject:pin_test];
+        pthread_mutex_unlock(&g_res_mu);
+        if (!pin_test_resident) MDIE("indirect residency probe: last pin ignored");
+        res_add(pin_test); res_unpin(pin_test);
+        pthread_mutex_lock(&g_res_mu);
+        pin_test_resident = [g_res_objects containsObject:pin_test];
+        pthread_mutex_unlock(&g_res_mu);
+        if (!pin_test_resident) MDIE("indirect residency probe: re-registration lost");
+        res_remove(pin_test);
+        if (res_pin(pin_test)) MDIE("indirect residency probe: unregistered allocation accepted");
+        if (reup_on()) {
+            MTLTextureDescriptor *recycle_desc = [MTLTextureDescriptor new];
+            recycle_desc.textureType = MTLTextureType2D; recycle_desc.pixelFormat = MTLPixelFormatR32Float;
+            recycle_desc.width = 13; recycle_desc.height = recycle_desc.depth = 1;
+            recycle_desc.storageMode = MTLStorageModeShared; recycle_desc.usage = MTLTextureUsageShaderRead;
+#ifdef HOGWARTS_EXPERIMENTAL
+            MTLTextureDescriptor *indirect_desc = [MTLTextureDescriptor new];
+            indirect_desc.textureType = MTLTextureType3D; indirect_desc.pixelFormat = MTLPixelFormatR32Float;
+            indirect_desc.width = 13; indirect_desc.height = indirect_desc.depth = 1;
+            indirect_desc.storageMode = MTLStorageModeShared; indirect_desc.usage = MTLTextureUsageShaderRead;
+            id<MTLTexture> indirect_tex = [g_dev newTextureWithDescriptor:indirect_desc];
+            if (!indirect_tex) MDIE("indirect recycle probe: 3D allocation failed");
+            reup_key indirect_key = reup_key_of(indirect_desc);
+            res_add(indirect_tex);
+            g_reup_3d_guard_negative = getenv("TOTK_PROBE_HOGWARTS_3D_RECYCLE_NEGATIVE") != NULL;
+            if (reup_offer(indirect_tex, &indirect_key) || reup_holds(indirect_tex))
+                MDIE("indirect recycle probe: 3D allocation entered recycler");
+            g_reup_3d_guard_negative = 0;
+            if (!res_pin(indirect_tex)) MDIE("indirect recycle probe: 3D allocation rejected");
+            res_unpin(indirect_tex); res_remove(indirect_tex);
+            checked += 2;
+#endif
+            id<MTLTexture> recycle_tex = [g_dev newTextureWithDescriptor:recycle_desc];
+            if (!recycle_tex) MDIE("indirect recycle probe: allocation failed");
+            reup_key key = reup_key_of(recycle_desc);
+            res_add(recycle_tex);
+            if (!res_pin(recycle_tex) || !res_pin(recycle_tex) || !reup_offer(recycle_tex, &key))
+                MDIE("indirect recycle probe: pin or offer failed");
+            mtl_sub_begin(); mtl_exec((const uint8_t *)&end); mtl_sub_commit(); mtl_finish();
+            g_reup_pin_guard_negative = getenv("TOTK_PROBE_INDIRECT_RECYCLE_NEGATIVE") != NULL;
+            id<MTLTexture> early = reup_take(&key);
+            g_reup_pin_guard_negative = 0;
+            if (early) MDIE("indirect recycle probe: pinned texture reused before lease release");
+            if (!reup_holds(recycle_tex)) MDIE("indirect recycle probe: pinned texture removed from cache");
+            res_unpin(recycle_tex);
+            if (reup_take(&key)) MDIE("indirect recycle probe: texture reused before last pin");
+            res_unpin(recycle_tex);
+            id<MTLTexture> after = reup_take(&key);
+            if (after != recycle_tex) MDIE("indirect recycle probe: unpinned texture not reusable");
+            g_res_recycled_negative = getenv("TOTK_PROBE_INDIRECT_RECYCLED_PIN_NEGATIVE") != NULL;
+            if (res_pin(recycle_tex)) MDIE("indirect recycle probe: recycled allocation accepted for indirect pin");
+            g_res_recycled_negative = 0;
+            res_remove(recycle_tex);
+            id<MTLTexture> retired = [g_dev newTextureWithDescriptor:recycle_desc];
+            if (!retired) MDIE("indirect recycle probe: retired allocation failed");
+            res_add(retired);
+            if (!res_pin(retired) || !reup_offer(retired, &key))
+                MDIE("indirect recycle probe: retired pin or offer failed");
+            res_remove(retired);
+            mtl_sub_begin(); mtl_exec((const uint8_t *)&end); mtl_sub_commit(); mtl_finish();
+            if (reup_take(&key)) MDIE("indirect recycle probe: retired pinned texture reused");
+            res_unpin(retired);
+            if (reup_take(&key) || reup_holds(retired))
+                MDIE("indirect recycle probe: nonresident texture left reusable");
+            checked += 7;
+            enum { RACE_COUNT = 16 };
+            id<MTLTexture> race_textures[RACE_COUNT];
+            reup_key race_keys[RACE_COUNT];
+            for (int i = 0; i < RACE_COUNT; i++) {
+                recycle_desc.width = 100 + i;
+                race_keys[i] = reup_key_of(recycle_desc);
+                race_textures[i] = [g_dev newTextureWithDescriptor:recycle_desc];
+                if (!race_textures[i]) MDIE("indirect recycle race: allocation failed");
+                res_add(race_textures[i]);
+                if (!reup_offer(race_textures[i], &race_keys[i])) MDIE("indirect recycle race: offer failed");
+            }
+            mtl_sub_begin(); mtl_exec((const uint8_t *)&end); mtl_sub_commit(); mtl_finish();
+            for (int i = 0; i < RACE_COUNT; i++) {
+                id<MTLTexture> candidate = race_textures[i]; reup_key race_key = race_keys[i];
+                dispatch_semaphore_t start = dispatch_semaphore_create(0);
+                dispatch_group_t group = dispatch_group_create();
+                __block int acquired = 0;
+                __block id<MTLTexture> taken = nil;
+                dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                    dispatch_semaphore_wait(start, DISPATCH_TIME_FOREVER);
+                    acquired = res_pin(candidate);
+                });
+                dispatch_group_async(group, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                    dispatch_semaphore_wait(start, DISPATCH_TIME_FOREVER);
+                    taken = reup_take(&race_key);
+                });
+                dispatch_semaphore_signal(start); dispatch_semaphore_signal(start);
+                dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+                if (!!acquired == !!taken || (taken && taken != candidate))
+                    MDIE("indirect recycle race: pin and recycle both succeeded or both failed");
+                if (acquired) {
+                    res_unpin(candidate);
+                    if (reup_take(&race_key) != candidate) MDIE("indirect recycle race: released texture not reused");
+                }
+                if (res_pin(candidate)) MDIE("indirect recycle race: reused texture accepted for indirect pin");
+                res_remove(candidate); checked += 2;
+            }
+        }
+        tex_t guest = {0}; guest.serial = 0xfffed301;
+        guest.d = (nvn_texdesc){.width=2,.height=1,.depth=1,.levels=1,.target=NVN_TEXTURE_TARGET_3D};
+        serial_put(guest.serial, tex); mtl_reg_tex(71, &guest, NULL);
+        id<MTLTexture> __attribute__((objc_precise_lifetime)) alternate = [g_dev newTextureWithDescriptor:d];
+        if (!alternate) MDIE("indirect Metal 4 probe: alternate texture allocation");
+        float alternate_texels[] = {.5f, .625f};
+        [alternate replaceRegion:MTLRegionMake3D(0,0,0,2,1,1) mipmapLevel:0 slice:0
+                       withBytes:alternate_texels bytesPerRow:sizeof alternate_texels bytesPerImage:sizeof alternate_texels];
+        res_add(alternate);
+        tex_t guest_alternate = guest; guest_alternate.serial = 0xfffed303;
+        serial_put(guest_alternate.serial, alternate); mtl_reg_tex(72, &guest_alternate, NULL);
+        samp_par sampler = {.lod_max=16,.aniso=1}; mtl_reg_samp(73, &sampler);
+#ifdef HOGWARTS_EXPERIMENTAL
+        MTLTextureDescriptor *scalar_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                                                              width:2 height:1 mipmapped:NO];
+        scalar_desc.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> scalar_texture = [g_dev newTextureWithDescriptor:scalar_desc];
+        if (!scalar_texture) MDIE("scalar indirect resolver probe: texture allocation");
+        res_add(scalar_texture);
+        tex_t scalar_guest = {0}; scalar_guest.serial = 0xfffed306;
+        scalar_guest.d = (nvn_texdesc){.width=2,.height=1,.depth=1,.levels=1,.target=NVN_TEXTURE_TARGET_2D};
+        serial_put(scalar_guest.serial, scalar_texture); mtl_reg_tex(79, &scalar_guest, NULL);
+        NvIndirectLease *scalar_lease = [NvIndirectLease new];
+        uint64_t scalar_tex_id = 0, scalar_samp_id = 0, wrong_tex = 11, wrong_samp = 12;
+        registry_lock();
+        int scalar_ok = indirect_resolve_registered_type((__bridge void *)scalar_lease,
+            (nvn_indirect_texture_ids){79,73}, &scalar_tex_id, &scalar_samp_id, MTLTextureType2D);
+        int wrong_type = indirect_resolve_registered_type((__bridge void *)scalar_lease,
+            (nvn_indirect_texture_ids){71,73}, &wrong_tex, &wrong_samp, MTLTextureType2D);
+        int wrong_sampler = indirect_resolve_registered_type((__bridge void *)scalar_lease,
+            (nvn_indirect_texture_ids){79,0}, &wrong_tex, &wrong_samp, MTLTextureType2D);
+        registry_unlock();
+        if (!scalar_ok || scalar_tex_id != scalar_texture.gpuResourceID._impl || !scalar_samp_id ||
+            wrong_type || wrong_sampler || wrong_tex != 11 || wrong_samp != 12 ||
+            scalar_lease.allocations.count != 1 || scalar_lease.objects.count != 2)
+            MDIE("scalar indirect resolver probe: invalid resource or pin state");
+        [scalar_lease releasePins];
+        NSError *array_error = nil;
+        id<MTLLibrary> array_library = [g_dev newLibraryWithSource:
+            @"#include <metal_stdlib>\nusing namespace metal;\n"
+             "struct A { array<texture2d<float>, 32> t [[id(0)]]; array<sampler, 32> s [[id(32)]]; }; "
+             "kernel void test(constant A &a [[buffer(0)]], device float *o [[buffer(1)]], uint i [[thread_position_in_grid]]) "
+             "{ o[i] = a.t[i].sample(a.s[i], float2(0.5)).x; }"
+            options:nil error:&array_error];
+        NvShader *array_shader = [NvShader new];
+        array_shader->fn = [array_library newFunctionWithName:@"test"];
+        array_shader->ae = [array_shader->fn newArgumentEncoderWithBufferIndex:0];
+        array_shader->arg_len = array_shader->ae.encodedLength;
+        if (!array_shader->fn || !array_shader->ae || array_shader->arg_len != 64 * sizeof(uint64_t))
+            MDIE("2D indirect array probe: shader or encoder unavailable: %s", array_error.localizedDescription.UTF8String);
+        nvn_rbind array_tex = {.kind=NVN_RB_ITEX, .aid=0, .indirect_count=32, .ptr=4};
+        nvn_rbind array_samp = {.kind=NVN_RB_ISAMP, .aid=32, .indirect_count=32, .ptr=4};
+        nvn_indirect_texture_ids array_ids[32];
+        uint64_t array_slots[64] = {0}, array_before[64];
+        for (unsigned i = 0; i < 32; i++) array_ids[i] = (nvn_indirect_texture_ids){79,73};
+        unsigned array_failed = 99;
+        registry_lock();
+        int array_result = nvn_indirect_texture_bind_ids(array_ids, 32, array_slots, 64, 0, 32,
+            indirect_resolve_registered_2d, (__bridge void *)scalar_lease, &array_failed);
+        int array_matches = array_result == NVN_INDIRECT_OK &&
+            indirect_preflight_encoder_matches(array_shader, &array_tex, &array_samp, array_ids, array_slots);
+        array_slots[0] ^= 1;
+        int array_bad_matches = indirect_preflight_encoder_matches(array_shader, &array_tex, &array_samp, array_ids, array_slots);
+        array_slots[0] ^= 1;
+        registry_unlock();
+        if (array_result != NVN_INDIRECT_OK || !array_matches || array_bad_matches ||
+            scalar_lease.allocations.count != 32 || scalar_lease.objects.count != 64)
+            MDIE("2D indirect array probe: resolution or encoder comparison failed");
+        [scalar_lease releasePins];
+        memcpy(array_before, array_slots, sizeof array_slots);
+        array_ids[31].sampler_id = 0;
+        registry_lock();
+        array_result = nvn_indirect_texture_bind_ids(array_ids, 32, array_slots, 64, 0, 32,
+            indirect_resolve_registered_2d, (__bridge void *)scalar_lease, &array_failed);
+        registry_unlock();
+        if (array_result != NVN_INDIRECT_RESOURCE_UNAVAILABLE || array_failed != 31 ||
+            memcmp(array_slots, array_before, sizeof array_slots) || scalar_lease.allocations.count != 31)
+            MDIE("2D indirect array probe: partial resolution was published");
+        [scalar_lease releasePins];
+        if (scalar_lease.allocations.count || scalar_lease.objects.count)
+            MDIE("2D indirect array probe: lease not released");
+        checked += 3;
+        mtl_reg_tex(79, NULL, NULL); serial_del(scalar_guest.serial); res_remove(scalar_texture);
+        checked += 3;
+        MTLTextureDescriptor *cube_desc = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                                                                 size:2 mipmapped:NO];
+        cube_desc.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> cube_texture = [g_dev newTextureWithDescriptor:cube_desc];
+        cube_desc.pixelFormat = MTLPixelFormatR32Uint;
+        id<MTLTexture> cube_integer = [g_dev newTextureWithDescriptor:cube_desc];
+        if (!cube_texture || !cube_integer) MDIE("cube indirect resolver probe: texture allocation");
+        res_add(cube_texture); res_add(cube_integer);
+        tex_t cube_guest = {0}; cube_guest.serial = 0xfffed308;
+        cube_guest.d = (nvn_texdesc){.width=2,.height=2,.depth=1,.levels=1,.target=NVN_TEXTURE_TARGET_CUBEMAP};
+        tex_t cube_integer_guest = cube_guest; cube_integer_guest.serial = 0xfffed309;
+        serial_put(cube_guest.serial, cube_texture); mtl_reg_tex(79, &cube_guest, NULL);
+        serial_put(cube_integer_guest.serial, cube_integer); mtl_reg_tex(80, &cube_integer_guest, NULL);
+        NvIndirectLease *cube_lease = [NvIndirectLease new];
+        nvn_indirect_texture_ids cube_ids[] = {{79,73}, {79,73}};
+        uint64_t cube_slots[] = {11,12,13,14}, cube_before[4];
+        unsigned cube_failed = 99;
+        registry_lock();
+        int cube_ok = nvn_indirect_texture_bind_ids(cube_ids, 2, cube_slots, 4, 0, 2,
+            indirect_resolve_registered_cube, (__bridge void *)cube_lease, &cube_failed);
+        registry_unlock();
+        if (cube_ok != NVN_INDIRECT_OK || cube_slots[0] != cube_texture.gpuResourceID._impl ||
+            cube_slots[1] != cube_slots[0] || !cube_slots[2] || cube_slots[3] != cube_slots[2] ||
+            cube_lease.allocations.count != 2 || cube_lease.objects.count != 4)
+            MDIE("cube indirect resolver probe: valid array rejected");
+        [cube_lease releasePins];
+        for (unsigned negative = 0; negative < 3; negative++) {
+            cube_ids[1] = negative == 0 ? (nvn_indirect_texture_ids){71,73} :
+                negative == 1 ? (nvn_indirect_texture_ids){80,73} : (nvn_indirect_texture_ids){79,0};
+            memcpy(cube_before, cube_slots, sizeof cube_slots);
+            cube_failed = 99;
+            registry_lock();
+            int result = nvn_indirect_texture_bind_ids(cube_ids, 2, cube_slots, 4, 0, 2,
+                indirect_resolve_registered_cube, (__bridge void *)cube_lease, &cube_failed);
+            registry_unlock();
+            if (result != NVN_INDIRECT_RESOURCE_UNAVAILABLE || cube_failed != 1 ||
+                memcmp(cube_slots, cube_before, sizeof cube_slots) || cube_lease.allocations.count != 1)
+                MDIE("cube indirect resolver probe: invalid resource or rollback failed");
+            [cube_lease releasePins];
+            if (cube_lease.allocations.count || cube_lease.objects.count)
+                MDIE("cube indirect resolver probe: lease not released");
+        }
+        mtl_reg_tex(79, NULL, NULL); mtl_reg_tex(80, NULL, NULL);
+        serial_del(cube_guest.serial); serial_del(cube_integer_guest.serial);
+        res_remove(cube_texture); res_remove(cube_integer);
+        checked += 4;
+        scalar_desc.pixelFormat = MTLPixelFormatASTC_8x8_sRGB;
+        scalar_desc.width = 8; scalar_desc.height = 8;
+        id<MTLTexture> compressed_texture = [g_dev newTextureWithDescriptor:scalar_desc];
+        if (!compressed_texture) MDIE("scalar indirect resolver probe: compressed texture allocation");
+        res_add(compressed_texture);
+        scalar_guest.serial = 0xfffed307; scalar_guest.d.width = 8; scalar_guest.d.height = 8;
+        serial_put(scalar_guest.serial, compressed_texture); mtl_reg_tex(79, &scalar_guest, NULL);
+        scalar_tex_id = scalar_samp_id = 0;
+        registry_lock();
+        scalar_ok = indirect_resolve_registered_type((__bridge void *)scalar_lease,
+            (nvn_indirect_texture_ids){79,73}, &scalar_tex_id, &scalar_samp_id, MTLTextureType2D);
+        registry_unlock();
+        if (!scalar_ok || scalar_tex_id != compressed_texture.gpuResourceID._impl ||
+            !scalar_samp_id || scalar_lease.allocations.count != 1)
+            MDIE("scalar indirect resolver probe: compressed texture rejected");
+        [scalar_lease releasePins];
+        mtl_reg_tex(79, NULL, NULL); serial_del(scalar_guest.serial); res_remove(compressed_texture);
+        checked++;
+        scalar_desc.pixelFormat = MTLPixelFormatBC7_RGBAUnorm_sRGB;
+        id<MTLTexture> bc7_texture = [g_dev newTextureWithDescriptor:scalar_desc];
+        if (!bc7_texture) MDIE("scalar indirect resolver probe: BC7 texture allocation");
+        res_add(bc7_texture);
+        scalar_guest.serial = 0xfffed308;
+        serial_put(scalar_guest.serial, bc7_texture); mtl_reg_tex(79, &scalar_guest, NULL);
+        scalar_tex_id = scalar_samp_id = 0;
+        registry_lock();
+        scalar_ok = indirect_resolve_registered_type((__bridge void *)scalar_lease,
+            (nvn_indirect_texture_ids){79,73}, &scalar_tex_id, &scalar_samp_id, MTLTextureType2D);
+        registry_unlock();
+        if (!scalar_ok || scalar_tex_id != bc7_texture.gpuResourceID._impl ||
+            !scalar_samp_id || scalar_lease.allocations.count != 1)
+            MDIE("scalar indirect resolver probe: BC7 texture rejected");
+        [scalar_lease releasePins];
+        mtl_reg_tex(79, NULL, NULL); serial_del(scalar_guest.serial); res_remove(bc7_texture);
+        checked++;
+        view_t requested_view = {.set_levels=1, .nlevels=1};
+        mtl_reg_tex(75, &guest, &requested_view);
+        mtl_reg_tex(76, &guest, &requested_view);
+        uint64_t view_texture = 0, view_sampler = 0;
+        registry_lock();
+        int valid_view = indirect_resolve_registered(NULL, (nvn_indirect_texture_ids){75,73},
+                                                     &view_texture, &view_sampler);
+        g_hogwarts_view_failure_probe = 1;
+        g_hogwarts_view_fallback_negative = getenv("TOTK_PROBE_HOGWARTS_VIEW_FALLBACK_NEGATIVE") != NULL;
+        uint64_t rejected_texture = 11, rejected_sampler = 12;
+        int invalid_view = indirect_resolve_registered(NULL, (nvn_indirect_texture_ids){76,73},
+                                                       &rejected_texture, &rejected_sampler);
+        g_hogwarts_view_failure_probe = 0;
+        g_hogwarts_view_fallback_negative = 0;
+        int cached_after_failure = g_treg[76].view != NULL;
+        int output_changed = rejected_texture != 11 || rejected_sampler != 12;
+        int retried_view = indirect_resolve_registered(NULL, (nvn_indirect_texture_ids){76,73},
+                                                       &rejected_texture, &rejected_sampler);
+        registry_unlock();
+        if (!valid_view || !view_texture || !view_sampler || invalid_view || cached_after_failure || output_changed ||
+            !retried_view || rejected_texture == 11 || rejected_sampler == 12)
+            MDIE("indirect view probe: failed view accepted, cached, or not retried");
+        mtl_reg_tex(75, NULL, NULL); mtl_reg_tex(76, NULL, NULL);
+        checked += 3;
+#endif
+        tex_t finalized_guest = guest; finalized_guest.serial = 0xfffed304;
+        serial_put(finalized_guest.serial, tex); mtl_reg_tex(77, &finalized_guest, NULL);
+        pthread_mutex_lock(&g_smu);
+        totk_serial_add(&g_dead_serial, finalized_guest.serial);
+        ser_bump_locked(finalized_guest.serial);
+        pthread_mutex_unlock(&g_smu);
+        uint64_t dead_texture = 13, dead_sampler = 14;
+        registry_lock();
+        g_indirect_dead_guard_negative = getenv("TOTK_PROBE_INDIRECT_DEAD_NEGATIVE") != NULL;
+        int accepted_dead = indirect_resolve_registered(NULL, (nvn_indirect_texture_ids){77,73},
+                                                         &dead_texture, &dead_sampler);
+        g_indirect_dead_guard_negative = 0;
+        registry_unlock();
+        if (accepted_dead || dead_texture != 13 || dead_sampler != 14)
+            MDIE("indirect residency probe: finalized texture accepted");
+        mtl_reg_tex(77, NULL, NULL); serial_del(finalized_guest.serial);
+        checked++;
+#ifdef HOGWARTS_EXPERIMENTAL
+        id<MTLTexture> concurrent_tex = [g_dev newTextureWithDescriptor:d];
+        if (!concurrent_tex) MDIE("indirect finalize probe: allocation failed");
+        res_add(concurrent_tex);
+        __block tex_t concurrent_guest = guest;
+        concurrent_guest.serial = 0xfffed305;
+        serial_put(concurrent_guest.serial, concurrent_tex);
+        mtl_reg_tex(78, &concurrent_guest, NULL);
+        registry_lock();
+        uint64_t before_tex = 0, before_sampler = 0;
+        int before_finalize = indirect_resolve_registered(NULL, (nvn_indirect_texture_ids){78,73},
+                                                           &before_tex, &before_sampler);
+        registry_unlock();
+        if (!before_finalize) MDIE("indirect finalize probe: live texture unavailable");
+        g_finalize_probe_deleted = dispatch_semaphore_create(0);
+        g_finalize_probe_resume = dispatch_semaphore_create(0);
+        g_finalize_probe_unlocked = getenv("TOTK_PROBE_HOGWARTS_FINALIZE_UNLOCKED") != NULL;
+        dispatch_group_t finalize_group = dispatch_group_create();
+        dispatch_group_async(finalize_group, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            mtl_tex_release(&concurrent_guest);
+        });
+        if (dispatch_semaphore_wait(g_finalize_probe_deleted, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)))
+            MDIE("indirect finalize probe: finalizer did not reach serial deletion");
+        int lock_result = pthread_mutex_trylock(&g_rmu);
+        if (!lock_result) pthread_mutex_unlock(&g_rmu);
+        dispatch_semaphore_signal(g_finalize_probe_resume);
+        if (dispatch_group_wait(finalize_group, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)))
+            MDIE("indirect finalize probe: finalizer did not complete");
+        g_finalize_probe_deleted = nil; g_finalize_probe_resume = nil;
+        g_finalize_probe_unlocked = 0;
+        if (lock_result != EBUSY)
+            MDIE("indirect finalize probe: registry accessible during finalization");
+        uint64_t after_tex = 15, after_sampler = 16;
+        registry_lock();
+        int after_finalize = indirect_resolve_registered(NULL, (nvn_indirect_texture_ids){78,73},
+                                                          &after_tex, &after_sampler);
+        registry_unlock();
+        if (after_finalize || after_tex != 15 || after_sampler != 16)
+            MDIE("indirect finalize probe: finalized descriptor accepted");
+        mtl_reg_tex(78, NULL, NULL);
+        res_remove(concurrent_tex);
+        checked += 2;
+#endif
+        uint64_t handles[32];
+        for (int i = 0; i < 32; i++) handles[i] = 71;
+        handles[31] = 72;
+        memcpy(mem + 256, handles, sizeof handles);
+        uint64_t commands[8]; uint8_t *q = (uint8_t *)commands;
+        q += usp_bind(q, 1, 3, a0, sizeof handles);
+        memcpy(q, &end, sizeof end);
+        const uint64_t list[] = {(uint64_t)(uintptr_t)commands};
+        mtl_sub_begin(); mtl_sub_snapshot_ubos(list, 1); mtl_exec((const uint8_t *)&end);
+        memset(mem + 256, 0, sizeof handles);
+        p_bind_buf u = {1, 3, a0, sizeof handles};
+        nvn_rbind t = {.kind=NVN_RB_ITEX,.reg=3,.off=2,.aid=0,.indirect_count=2};
+        nvn_rbind s = {.kind=NVN_RB_ISAMP,.reg=3,.off=2,.aid=2,.indirect_count=2};
+        uint64_t slots[4] = {0}, previous[4]; unsigned failed = 99;
+        nvn_indirect_texture_ids decoded[2] = {{0}};
+        NSUInteger blocks_before = g_commit_blocks.count;
+        registry_lock();
+        int result = indirect_build_snapshot_slots_with_ids(&u, 73u << 20, &t, &s, slots, 4, &failed, decoded);
+        registry_unlock();
+        if (result != NVN_INDIRECT_OK || slots[0] != tex.gpuResourceID._impl ||
+            slots[1] != slots[0] || !slots[2] || slots[3] != slots[2] ||
+            decoded[0].texture_id != 71 || decoded[1].texture_id != 71 ||
+            decoded[0].sampler_id != 73 || decoded[1].sampler_id != 73 ||
+            g_commit_blocks.count != blocks_before + 1)
+            MDIE("indirect snapshot binding probe: snapshot or registry resolution failed");
+        indirect_registry_sample(slots, tex, value);
+        memcpy(previous, slots, sizeof slots);
+        blocks_before = g_commit_blocks.count;
+        NvIndirectLease *partial = [NvIndirectLease new];
+        nvn_indirect_texture_ids invalid_ids[2] = {{71,73},{9999,73}};
+        registry_lock();
+        int partial_result = nvn_indirect_texture_bind_ids(invalid_ids, 2, slots, 4, 0, 2,
+                                                            indirect_resolve_registered,
+                                                            (__bridge void *)partial, &failed);
+        registry_unlock();
+        if (partial_result != NVN_INDIRECT_RESOURCE_UNAVAILABLE || failed != 1 ||
+            partial.allocations.count != 1 || memcmp(slots, previous, sizeof slots))
+            MDIE("indirect residency probe: partial binding failed incorrectly");
+        [partial releasePins];
+        if (partial.allocations.count || partial.objects.count)
+            MDIE("indirect residency probe: partial binding retained resources");
+        registry_lock();
+        result = indirect_build_snapshot_slots_with_ids(&u, 74u << 20, &t, &s, slots, 4, &failed, decoded);
+        registry_unlock();
+        if (result != NVN_INDIRECT_RESOURCE_UNAVAILABLE || failed != 0 || memcmp(slots, previous, sizeof slots) ||
+            decoded[0].texture_id != 71 || decoded[0].sampler_id != 74 ||
+            g_commit_blocks.count != blocks_before)
+            MDIE("indirect snapshot binding probe: unavailable sampler changed slots");
+        u.size = 4;
+        nvn_indirect_texture_ids decoded_before[2]; memcpy(decoded_before, decoded, sizeof decoded);
+        registry_lock();
+        result = indirect_build_snapshot_slots_with_ids(&u, 73u << 20, &t, &s, slots, 4, &failed, decoded);
+        registry_unlock();
+        if (result != NVN_INDIRECT_SNAPSHOT_UNAVAILABLE || memcmp(slots, previous, sizeof slots) ||
+            memcmp(decoded, decoded_before, sizeof decoded))
+            MDIE("indirect snapshot binding probe: short snapshot accepted");
+        checked += 3;
+        u.size = sizeof handles; s.aid = 1;
+        registry_lock();
+        result = indirect_build_snapshot_slots(&u, 73u << 20, &t, &s, slots, 4, &failed);
+        registry_unlock();
+        if (result != NVN_INDIRECT_INVALID || memcmp(slots, previous, sizeof slots))
+            MDIE("indirect snapshot binding probe: overlapping arrays accepted");
+        s.aid = 2;
+        s.off++;
+        if (indirect_build_snapshot_slots(&u, 73u << 20, &t, &s, slots, 4, &failed) != NVN_INDIRECT_INVALID ||
+            memcmp(slots, previous, sizeof slots))
+            MDIE("indirect snapshot binding probe: mismatched reflection accepted");
+        s.off = 2;
+        id<MTLTexture> __attribute__((objc_precise_lifetime)) replacement = [g_dev newTextureWithDescriptor:d];
+        if (!replacement) MDIE("indirect Metal 4 probe: replacement texture allocation");
+        float replacement_value = .75f, replacement_texels[] = {replacement_value, .875f};
+        [replacement replaceRegion:MTLRegionMake3D(0,0,0,2,1,1) mipmapLevel:0 slice:0
+                          withBytes:replacement_texels bytesPerRow:sizeof replacement_texels bytesPerImage:sizeof replacement_texels];
+        res_add(replacement);
+        tex_t guest_replacement = guest; guest_replacement.serial = 0xfffed302;
+        serial_put(guest_replacement.serial, replacement);
+        NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "struct A { array<texture3d<float>, 32> t [[id(0)]]; array<sampler, 32> s [[id(32)]]; constant uint *u [[id(64)]]; }; "
+            "kernel void test(constant A &a [[buffer(0)]], device float *out [[buffer(1)]], "
+            "uint i [[thread_position_in_grid]]) { uint j = i ? 31 : 0; out[i] = a.t[j].sample(a.s[j], float3(1.25, 0.5, 0.5)).x + float(a.u[0]) * 0.001; } "
+            "vertex float4 vs(uint i [[vertex_id]]) { float2 p[3] = {float2(-1,-1),float2(3,-1),float2(-1,3)}; return float4(p[i],0,1); } "
+            "fragment float4 fs(constant A &a [[buffer(0)]], float4 p [[position]]) { "
+            "uint j = p.x < 1.0 ? 0 : 31; return float4(a.t[j].sample(a.s[j], float3(1.25,0.5,0.5)).x + float(a.u[0]) * 0.001); }";
+        NSError *error = nil;
+        id<MTLLibrary> library = [g_dev newLibraryWithSource:source options:nil error:&error];
+        id<MTLFunction> function = library ? [library newFunctionWithName:@"test"] : nil;
+        id<MTLComputePipelineState> pipeline = function ? [g_dev newComputePipelineStateWithFunction:function error:&error] : nil;
+        id<MTLArgumentEncoder> argument_encoder = function ? [function newArgumentEncoderWithBufferIndex:0] : nil;
+        if (!pipeline || !argument_encoder || argument_encoder.encodedLength != 65 * sizeof(uint64_t))
+            MDIE("indirect Metal 4 probe shader: %s", error.localizedDescription.UTF8String);
+        id<MTLBuffer> output = probe_buf(4 * sizeof(float));
+        NvShader *probe_shader = [NvShader new];
+        probe_shader->fn = function; probe_shader->ae = argument_encoder;
+        probe_shader->arg_len = argument_encoder.encodedLength; probe_shader->stage = 5;
+        probe_shader->rf.nb = 3; probe_shader->rf.b[0] = t; probe_shader->rf.b[1] = s;
+        probe_shader->rf.b[0].indirect_count = 32;
+        probe_shader->rf.b[1].indirect_count = 32; probe_shader->rf.b[1].aid = 32;
+        probe_shader->rf.b[2] = (nvn_rbind){.kind=NVN_RB_CBUF,.reg=3,.aid=64};
+        probe_shader->rf.has_indirect_textures = 1;
+        p_bind_buf saved_ubo = S.ubo[5][3]; uint64_t saved_sampler = S.samp[5][2];
+        S.ubo[5][3] = u; S.samp[5][2] = 74u << 20;
+        id<MTL4ComputeCommandEncoder> invalid_encoder = enc_c_begin(NULL);
+        NSUInteger invalid_blocks = g_commit_blocks.count;
+        if (encode_args_impl((id<MTLCommandEncoder>)invalid_encoder, probe_shader, 5, 0, 1, NULL) ||
+            probe_shader->ab_buf || g_commit_blocks.count != invalid_blocks)
+            MDIE("indirect Metal 4 probe: invalid encoding published arguments");
+        enc_c_end(invalid_encoder);
+        S.samp[5][2] = 73u << 20;
+        __weak id<MTLSamplerState> held_sampler[2];
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass) {
+                mtl_reg_tex(71, &guest_replacement, NULL);
+                sampler.ws = 1; mtl_reg_samp(73, &sampler);
+            }
+            id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL);
+            enc_c_pso(ce, pipeline);
+            if (!encode_args_impl((id<MTLCommandEncoder>)ce, probe_shader, 5, 0, 1, NULL))
+                MDIE("indirect Metal 4 probe: production argument builder rejected bindings");
+            registry_lock(); held_sampler[pass] = samp_by_id(73); registry_unlock();
+            uint64_t *encoded = (uint64_t *)((uint8_t *)probe_shader->ab_buf.contents + probe_shader->ab_off);
+            if (!held_sampler[pass] || encoded[0] != (pass ? replacement : tex).gpuResourceID._impl ||
+                encoded[31] != alternate.gpuResourceID._impl)
+                MDIE("indirect Metal 4 probe: registry replacement failed");
+            if (pass && getenv("TOTK_PROBE_INDIRECT_DROP_SAMPLER_PIN"))
+                [g_commit_blocks removeLastObject];
+            if (pass && getenv("TOTK_PROBE_INDIRECT_BAD_SAMPLER")) {
+                encoded[32] = previous[2]; encoded[63] = previous[3];
+            }
+            enc_c_args(ce, output.gpuAddress + pass * 2 * sizeof(float), 1);
+            [ce dispatchThreads:MTLSizeMake(2, 1, 1) threadsPerThreadgroup:MTLSizeMake(2, 1, 1)];
+            enc_c_end(ce);
+            if (!pass) {
+                uint64_t previous_gpu = probe_shader->ab_gpu;
+                NSUInteger previous_blocks = g_commit_blocks.count;
+                S.ubo[5][3].size = 4;
+                ce = enc_c_begin(NULL);
+                if (encode_args_impl((id<MTLCommandEncoder>)ce, probe_shader, 5, 0, 1, NULL) ||
+                    probe_shader->ab_gpu != previous_gpu || g_commit_blocks.count != previous_blocks)
+                    MDIE("indirect Metal 4 probe: failed snapshot published arguments");
+                enc_c_end(ce); S.ubo[5][3] = u;
+            }
+        }
+        MTLTextureDescriptor *output_desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:2 height:1 mipmapped:NO];
+        output_desc.storageMode = MTLStorageModeShared; output_desc.usage = MTLTextureUsageRenderTarget;
+        id<MTLTexture> render_output = [g_dev newTextureWithDescriptor:output_desc];
+        MTLRenderPipelineDescriptor *pipeline_desc = [MTLRenderPipelineDescriptor new];
+        pipeline_desc.vertexFunction = [library newFunctionWithName:@"vs"];
+        pipeline_desc.fragmentFunction = [library newFunctionWithName:@"fs"];
+        pipeline_desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
+        id<MTLRenderPipelineState> render_pipeline = [g_dev newRenderPipelineStateWithDescriptor:pipeline_desc error:&error];
+        NvShader *fragment = [NvShader new];
+        fragment->fn = pipeline_desc.fragmentFunction;
+        fragment->ae = [fragment->fn newArgumentEncoderWithBufferIndex:0];
+        fragment->arg_len = fragment->ae.encodedLength; fragment->stage = 1;
+        fragment->rf = probe_shader->rf;
+        if (!render_output || !render_pipeline || fragment->arg_len != 65 * sizeof(uint64_t))
+            MDIE("indirect Metal 4 fragment probe: %s", error.localizedDescription.UTF8String);
+        res_add(render_output);
+        p_bind_buf saved_fragment_ubo = S.ubo[1][3]; uint64_t saved_fragment_sampler = S.samp[1][2];
+        S.ubo[1][3] = u; S.samp[1][2] = 73u << 20;
+        MTL4RenderPassDescriptor *render_pass = [MTL4RenderPassDescriptor new];
+        render_pass.colorAttachments[0].texture = render_output;
+        render_pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        render_pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        render_pass.renderTargetWidth = 2; render_pass.renderTargetHeight = 1;
+        id<MTL4RenderCommandEncoder> render = enc_r_begin(render_pass);
+        enc_r_pso(render, render_pipeline); enc_r_cull(render, MTLCullModeNone);
+        enc_r_viewport(render, (MTLViewport){0,0,2,1,0,1});
+        if (!encode_args_impl((id<MTLCommandEncoder>)render, fragment, 1, 0, 1, NULL))
+            MDIE("indirect Metal 4 fragment probe: argument encoding failed");
+        if (getenv("TOTK_PROBE_INDIRECT_DROP_SAMPLER_PIN"))
+            [g_commit_blocks removeLastObject];
+        enc_r_draw(render, MTLPrimitiveTypeTriangle, 0, 3); enc_r_end(render);
+        S.ubo[1][3] = saved_fragment_ubo; S.samp[1][2] = saved_fragment_sampler;
+        S.ubo[5][3] = saved_ubo; S.samp[5][2] = saved_sampler;
+        id<MTLSharedEvent> gate = [g_dev newSharedEvent];
+        if (!gate) MDIE("indirect Metal 4 probe: event allocation");
+        gate.signaledValue = 0;
+        [g_q4 waitForEvent:gate value:1];
+        uint64_t fence = mtl_sub_commit();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC),
+                       dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ gate.signaledValue = 1; });
+        if (__atomic_load_n(&g_done, __ATOMIC_ACQUIRE) >= fence)
+            MDIE("indirect Metal 4 probe: gated submission completed early");
+        mtl_reg_tex(71, NULL, NULL); mtl_reg_tex(72, NULL, NULL); sampler.ws = 0; mtl_reg_samp(73, &sampler);
+        if (!held_sampler[0] || !held_sampler[1])
+            MDIE("indirect Metal 4 probe: sampler released before submission completion");
+        res_remove(tex); res_remove(replacement); res_remove(alternate);
+        pthread_mutex_lock(&g_res_mu);
+        int retained_tex = [g_res_objects containsObject:tex];
+        int retained_replacement = [g_res_objects containsObject:replacement];
+        pthread_mutex_unlock(&g_res_mu);
+        if (!retained_tex || !retained_replacement || res_pin(tex))
+            MDIE("indirect Metal 4 probe: pending residency removal not protected");
+        if (__atomic_load_n(&g_done, __ATOMIC_ACQUIRE) >= fence)
+            MDIE("indirect Metal 4 probe: descriptors replaced after completion");
+        gate.signaledValue = 1; mtl_finish();
+        const float *samples = output.contents;
+        if (fabsf(samples[0] - (value + .071f)) > .0001f || fabsf(samples[1] - (.625f + .071f)) > .0001f ||
+            fabsf(samples[2] - (replacement_value + .071f)) > .0001f || fabsf(samples[3] - (.5f + .071f)) > .0001f)
+            MDIE("indirect Metal 4 probe: pixels %g %g %g %g", samples[0], samples[1], samples[2], samples[3]);
+        float fragment_pixels[8];
+        [render_output getBytes:fragment_pixels bytesPerRow:sizeof fragment_pixels
+                      fromRegion:MTLRegionMake2D(0,0,2,1) mipmapLevel:0];
+        if (fabsf(fragment_pixels[0] - (replacement_value + .071f)) > .0001f ||
+            fabsf(fragment_pixels[4] - (.5f + .071f)) > .0001f)
+            MDIE("indirect Metal 4 fragment probe: pixels %g %g", fragment_pixels[0], fragment_pixels[4]);
+        res_remove(render_output);
+        pthread_mutex_lock(&g_res_mu);
+        retained_tex = [g_res_objects containsObject:tex];
+        retained_replacement = [g_res_objects containsObject:replacement];
+        pthread_mutex_unlock(&g_res_mu);
+        if (retained_tex || retained_replacement)
+            MDIE("indirect Metal 4 probe: completed residency pins not released");
+        serial_del(guest.serial); serial_del(guest_replacement.serial); serial_del(guest_alternate.serial);
+        checked += 31;
+    }
 
     /* 2. a writable storage buffer of the previous submission, still executing, writes a bound range */
     memset(mem + 256, 0x11, 96); memset(mem + 512, 0x11, 64);
@@ -13844,6 +15524,12 @@ int mtl_probe_ubo_snapshot(void) {
     if (done >= writer) MDIE("ubo snapshot probe: the held-back submission completed early (done %llu, writer %llu)", (unsigned long long)done, (unsigned long long)writer); checked++;
     if (neg != 3) {
         if (usnap_find(a0, 96) || usnap_find(a1, 64) || !usnap_find(a2, 128) || g_usnap_skip_gpu != skip0 + 1) MDIE("ubo snapshot probe: the range of the executing GPU write was copied (or the far range was not)");
+        checked++;
+    }
+    if (!neg) {
+        p_bind_buf u = {1, 3, a0, 96};
+        nvn_indirect_texture_ids ids[4];
+        if (indirect_uniform_snapshot(&u, 4, 0, ids)) MDIE("indirect snapshot: in-flight GPU write accepted");
         checked++;
     }
     usp_read(ps, a0, 96, out, 768);

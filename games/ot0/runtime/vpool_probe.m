@@ -3,6 +3,7 @@
 #include "runtime.h"
 #include "../third_party/d2r_gfx/gfx/nvn/nvn_protos.h"
 #include "../third_party/d2r_gfx/gfx/nvn/nvn_obj.h"
+#include "../third_party/d2r_gfx/gfx/nvn/nvn_indirect_hazard.h"
 #include "../third_party/d2r_gfx/gfx/nvn/nvn_mtl.h"
 #include "../third_party/d2r_gfx/gfx/nvn/totk_vpool.h"
 #include <stdio.h>
@@ -69,7 +70,40 @@ void runtime_vpool_probe(void){
  memset(mem(&v2)+2*PAGE,0x71,PAGE);
  expect(all(mem(&v1)+PAGE,0x71,PAGE),"CPU write through V2 visible through V1");
  expect(all(storage,0xee,size),"game storage of no-access physical pool untouched");
+ tex_t sampled={.mem=mem(&v1)+PAGE,.pool=(pool_t *)(void *)&v1,.serial=1};
+ tex_t target={.mem=mem(&v2)+2*PAGE,.pool=(pool_t *)(void *)&v2,.serial=2};
+ sampled.L.size=target.L.size=PAGE;
+ expect(nvn_indirect_range_relation((uintptr_t)sampled.mem,PAGE,sampled.serial,
+        (uintptr_t)target.mem,PAGE,target.serial)==NVN_INDIRECT_RANGE_DISJOINT,
+        "virtual alias has disjoint guest addresses");
+ expect(nvn_indirect_texture_relation(&sampled,&target)==NVN_INDIRECT_RANGE_UNKNOWN,
+        "indirect hazard classifier refuses physically aliased virtual pools");
+ pool_t apparent_physical_a={0},apparent_physical_b={0};
+ sampled.pool=&apparent_physical_a;target.pool=&apparent_physical_b;
+ expect(nvn_indirect_texture_relation(&sampled,&target)==NVN_INDIRECT_RANGE_UNKNOWN,
+        "non-virtual pool flags do not prove aliased host mappings disjoint");
  gpu_checks(&v1,&v2);
+ uintptr_t backing=0, v1base=(uintptr_t)mem(&v1), v2base=(uintptr_t)mem(&v2);
+ uintptr_t physbase=(uintptr_t)mem(&phys);
+ expect(totk_vpool_backing(v1base+PAGE,PAGE,&backing)&&backing==physbase+2*PAGE,"initial diagnostic backing");
+ expect(!totk_vpool_backing(v1base,0,&backing)&&!totk_vpool_backing(UINTPTR_MAX-1,4,&backing)&&
+        !totk_vpool_backing(v1base,PAGE,NULL),"reject invalid diagnostic backing queries");
+ expect(totk_vpool_known_overlap(v1base+PAGE,PAGE,v2base+2*PAGE,PAGE)==1,
+        "known overlap detects distinct virtual aliases");
+ expect(totk_vpool_known_overlap(v1base+PAGE+32,128,physbase+2*PAGE+64,128)==1,
+        "known overlap detects virtual and physical aliases");
+ expect(totk_vpool_known_overlap(physbase+2*PAGE+64,128,v1base+PAGE+32,128)==1,
+        "known overlap is symmetric for virtual and physical aliases");
+ expect(totk_vpool_known_overlap(v1base+PAGE,64,physbase+2*PAGE+64,64)==0,
+        "adjacent backing ranges do not overlap");
+ expect(totk_vpool_known_overlap(v1base,3*PAGE,v2base+2*PAGE,PAGE)==1,
+        "known overlap detects a partial mapped fragment");
+ expect(totk_vpool_known_overlap(v1base,PAGE,v2base+2*PAGE,PAGE)==0,
+        "different backing remains unknown, not disjoint");
+ expect(totk_vpool_known_overlap(0,PAGE,v2base,PAGE)==-1 &&
+        totk_vpool_known_overlap(UINTPTR_MAX-1,4,v2base,PAGE)==-1 &&
+        totk_vpool_known_overlap(v1base,0,v2base,PAGE)==-1,
+        "known overlap rejects invalid ranges");
  // Negative controls leave mappings intact.
  expect(!map(&v1,&phys,0x1000,0,PAGE),"reject unaligned physical offset");
  expect(!map(&v1,&phys,0,3*PAGE,2*PAGE),"reject virtual range overflow");
@@ -78,11 +112,32 @@ void runtime_vpool_probe(void){
  expect(!map(&phys,&phys,0,0,PAGE),"reject physical pool as mapping target");
  expect(all(mem(&v1),0x3a,PAGE),"rejected requests did not change mappings");
  pool_init(&bad,raw+0x1000,size,0x104,0);expect(1,"reject CPU-visible unaligned physical pool");
+ expect(map(&v1,&phys,0,PAGE,PAGE),"remap middle virtual page");
+ expect(totk_vpool_backing(v1base,PAGE,&backing)&&backing==physbase+PAGE,"remap preserves left backing");
+ expect(totk_vpool_backing(v1base+PAGE,PAGE,&backing)&&backing==physbase,"remap publishes new backing");
+ expect(totk_vpool_backing(v1base+2*PAGE,PAGE,&backing)&&backing==physbase+3*PAGE,"remap preserves right backing");
+ expect(!totk_vpool_backing(v1base,2*PAGE,&backing),"noncontiguous backing rejected");
+ expect(totk_vpool_known_overlap(v1base+PAGE,PAGE,v2base+2*PAGE,PAGE)==0,
+        "remap removes old known alias");
+ expect(totk_vpool_known_overlap(v1base+PAGE,PAGE,physbase,PAGE)==1,
+        "remap publishes new known alias");
  // Unmap V1 page 0: reads zero again, the physical page keeps its data for V2.
  expect(map(&v1,NULL,0,0,PAGE),"unmap virtual page");
  expect(all(mem(&v1),0,PAGE),"unmapped virtual page reads zero");
  expect(all(mem(&v2)+PAGE,0x3a,PAGE),"physical data survives unmap of another alias");
- CALL(nvnMemoryPoolFinalize,&v1);CALL(nvnMemoryPoolFinalize,&v2);CALL(nvnMemoryPoolFinalize,&phys);
+ expect(!totk_vpool_backing(v1base,PAGE,&backing)&&
+        totk_vpool_backing(v1base+PAGE,PAGE,&backing)&&backing==physbase,"unmap removes only unmapped backing");
+ expect(totk_vpool_known_overlap(v1base,PAGE,v2base+PAGE,PAGE)==0,
+        "unmap removes known alias");
+ CALL(nvnMemoryPoolFinalize,&v1);
+ expect(!totk_vpool_backing(v1base+PAGE,PAGE,&backing),"finalized virtual pool has no diagnostic backing");
+ expect(totk_vpool_known_overlap(v1base+PAGE,PAGE,physbase,PAGE)==0,
+        "finalized virtual mapping has no known alias");
+ CALL(nvnMemoryPoolFinalize,&phys);
+ expect(!totk_vpool_backing(v2base+PAGE,PAGE,&backing),"finalized physical pool has no diagnostic backing");
+ expect(totk_vpool_known_overlap(v2base+PAGE,PAGE,physbase+PAGE,PAGE)==0,
+        "finalized physical mapping has no known alias");
+ CALL(nvnMemoryPoolFinalize,&v2);
  free(raw);
- printf("{\"status\":\"pass\",\"checks\":%d,\"request_bytes\":%zu,\"page_bytes\":%llu,\"scope\":\"NVNmappingRequest layout from runtime dump; CPU and Metal GPU aliasing between two virtual pools of one physical pool; unmap; 6 negative controls; no drawing\"}\n",checks,sizeof(totk_mapping_request),(unsigned long long)PAGE);
+ printf("{\"status\":\"pass\",\"checks\":%d,\"request_bytes\":%zu,\"page_bytes\":%llu,\"scope\":\"NVNmappingRequest layout; CPU and Metal GPU aliases; indirect hazard classifier; diagnostic backing and known overlap; split, remap, unmap and finalization; invalid requests; no drawing\"}\n",checks,sizeof(totk_mapping_request),(unsigned long long)PAGE);
 }

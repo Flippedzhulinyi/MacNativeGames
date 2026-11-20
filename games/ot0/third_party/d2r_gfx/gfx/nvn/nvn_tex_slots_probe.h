@@ -1,5 +1,61 @@
 /* Included by nvn_mtl.m: production encode_args, descriptor publication and GPU
    pixel checks. Inputs are immutable until mtl_finish. Probe caches stay isolated. */
+static void indirect_registry_sample(uint64_t slots[4], id<MTLTexture> tex, float expected) {
+    NSError *error = nil;
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+        "struct A { array<texture3d<float>, 2> t [[id(0)]]; array<sampler, 2> s [[id(2)]]; }; "
+        "kernel void test(constant A &a [[buffer(0)]], device float *out [[buffer(1)]], "
+        "uint i [[thread_position_in_grid]]) { out[i] = a.t[i].sample(a.s[i], float3(0.5)).x; } "
+        "vertex float4 vs(uint i [[vertex_id]]) { float2 p[3] = {float2(-1,-1),float2(3,-1),float2(-1,3)}; return float4(p[i],0,1); } "
+        "fragment float4 fs(constant A &a [[buffer(0)]], float4 p [[position]]) { "
+        "uint i = uint(p.x); return a.t[i].sample(a.s[i], float3(0.5)); }";
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:source options:nil error:&error];
+    id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"test"] : nil;
+    id<MTLComputePipelineState> ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&error] : nil;
+    id<MTLArgumentEncoder> ae = fn ? [fn newArgumentEncoderWithBufferIndex:0] : nil;
+    if (!ps || !ae || ae.encodedLength != sizeof(uint64_t) * 4)
+        MDIE("indirect registry probe shader: %s", error.localizedDescription.UTF8String);
+    id<MTLBuffer> args = [g_dev newBufferWithBytes:slots length:sizeof(uint64_t) * 4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out = [g_dev newBufferWithLength:sizeof(float) * 2 options:MTLResourceStorageModeShared];
+    id<MTLCommandQueue> queue = [g_dev newCommandQueue];
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    if (!args || !out || !queue || !cb || !ce) MDIE("indirect registry probe command allocation");
+    [ce setComputePipelineState:ps]; [ce setBuffer:args offset:0 atIndex:0];
+    [ce setBuffer:out offset:0 atIndex:1]; [ce useResource:tex usage:MTLResourceUsageRead];
+    [ce dispatchThreads:MTLSizeMake(2,1,1) threadsPerThreadgroup:MTLSizeMake(2,1,1)];
+    [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted)
+        MDIE("indirect registry probe GPU: %s", cb.error.localizedDescription.UTF8String);
+    float *result = out.contents;
+    if (fabsf(result[0] - expected) > 0.0001f || fabsf(result[1] - expected) > 0.0001f)
+        MDIE("indirect registry probe pixels %g %g expected %g", result[0], result[1], expected);
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float width:2 height:1 mipmapped:NO];
+    d.storageMode = MTLStorageModeShared; d.usage = MTLTextureUsageRenderTarget;
+    id<MTLTexture> output = [g_dev newTextureWithDescriptor:d];
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA32Float;
+    id<MTLRenderPipelineState> renderPS = [g_dev newRenderPipelineStateWithDescriptor:pd error:&error];
+    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = output;
+    pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    cb = [queue commandBuffer];
+    id<MTLRenderCommandEncoder> render = output && renderPS ? [cb renderCommandEncoderWithDescriptor:pass] : nil;
+    if (!render) MDIE("indirect registry probe render: %s", error.localizedDescription.UTF8String);
+    [render setRenderPipelineState:renderPS]; [render setFragmentBuffer:args offset:0 atIndex:0];
+    [render useResource:tex usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+    [render drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [render endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted)
+        MDIE("indirect registry probe fragment GPU: %s", cb.error.localizedDescription.UTF8String);
+    float pixels[8];
+    [output getBytes:pixels bytesPerRow:sizeof pixels fromRegion:MTLRegionMake2D(0,0,2,1) mipmapLevel:0];
+    if (fabsf(pixels[0] - expected) > 0.0001f || fabsf(pixels[4] - expected) > 0.0001f)
+        MDIE("indirect registry probe fragment pixels %g %g expected %g", pixels[0], pixels[4], expected);
+}
+
 int mtl_probe_tex_slots(void) {
     mtl_init(); int checked = 0;
     const char *ne = getenv("TOTK_PROBE_NEGATIVE"); int negative = ne ? atoi(ne) : 0;
@@ -17,6 +73,124 @@ int mtl_probe_tex_slots(void) {
     td.storageMode = MTLStorageModePrivate; td.usage = MTLTextureUsageRenderTarget;
     output = [g_dev newTextureWithDescriptor:td]; res_add(output);
     op_hdr end = {OP_END,8};
+    if (!negative) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+        d.textureType = MTLTextureType3D; d.pixelFormat = MTLPixelFormatR32Float;
+        d.width = d.height = d.depth = 1; d.storageMode = MTLStorageModeShared;
+        d.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> a = [g_dev newTextureWithDescriptor:d], b = [g_dev newTextureWithDescriptor:d];
+        if (!a || !b) MDIE("indirect registry probe texture allocation");
+        float av = 0.25f, bv = 0.75f;
+        [a replaceRegion:MTLRegionMake3D(0,0,0,1,1,1) mipmapLevel:0 slice:0 withBytes:&av bytesPerRow:4 bytesPerImage:4];
+        [b replaceRegion:MTLRegionMake3D(0,0,0,1,1,1) mipmapLevel:0 slice:0 withBytes:&bv bytesPerRow:4 bytesPerImage:4];
+        res_add(a); res_add(b);
+        tex_t ta = {0}, tb = {0};
+        ta.serial = 0xfffed101; tb.serial = 0xfffed102;
+        ta.d = (nvn_texdesc){.width=1,.height=1,.depth=1,.levels=1,.target=NVN_TEXTURE_TARGET_3D};
+        tb.d = ta.d;
+        serial_put(ta.serial,a); serial_put(tb.serial,b);
+        mtl_reg_tex(71,&ta,NULL); mtl_reg_samp(73,&clamp);
+        uint64_t handles[2] = {71,71}, slots[4] = {0}, previous[4] = {0};
+        registry_lock();
+        int r = nvn_indirect_texture_bind(handles,sizeof handles,2,73u<<20,slots,4,0,2,
+                                           indirect_resolve_registered,NULL,NULL);
+        registry_unlock();
+        if (r != NVN_INDIRECT_OK || slots[0] != a.gpuResourceID._impl || slots[1] != slots[0] ||
+            !slots[2] || slots[2] != slots[3]) MDIE("indirect registry probe initial bindings");
+        indirect_registry_sample(slots,a,av);
+        checked += 4;
+        mtl_reg_tex(71,&tb,NULL);
+        registry_lock();
+        r = nvn_indirect_texture_bind(handles,sizeof handles,2,73u<<20,slots,4,0,2,
+                                      indirect_resolve_registered,NULL,NULL);
+        registry_unlock();
+        if (r != NVN_INDIRECT_OK || slots[0] != b.gpuResourceID._impl) MDIE("indirect registry probe replacement");
+        indirect_registry_sample(slots,b,bv);
+        checked++;
+        d.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        id<MTLTexture> bgra = [g_dev newTextureWithDescriptor:d];
+        if (!bgra) MDIE("indirect registry probe BGRA allocation");
+        const uint8_t bgra_pixel[] = {64, 128, 192, 255};
+        [bgra replaceRegion:MTLRegionMake3D(0,0,0,1,1,1) mipmapLevel:0 slice:0
+                  withBytes:bgra_pixel bytesPerRow:4 bytesPerImage:4];
+        res_add(bgra);
+        tex_t bgra_guest = ta; bgra_guest.serial = 0xfffed106;
+        serial_put(bgra_guest.serial,bgra); mtl_reg_tex(71,&bgra_guest,NULL);
+        registry_lock();
+        r = nvn_indirect_texture_bind(handles,sizeof handles,2,73u<<20,slots,4,0,2,
+                                      indirect_resolve_registered,NULL,NULL);
+        registry_unlock();
+        if (r != NVN_INDIRECT_OK || slots[0] != bgra.gpuResourceID._impl)
+            MDIE("indirect registry probe BGRA bindings");
+        indirect_registry_sample(slots,bgra,192.0f / 255.0f);
+        checked++;
+        d.pixelFormat = MTLPixelFormatR32Float;
+        memcpy(previous,slots,sizeof slots); handles[1] = 9999;
+        unsigned failed = 9;
+        registry_lock();
+        r = nvn_indirect_texture_bind(handles,sizeof handles,2,73u<<20,slots,4,0,2,
+                                      indirect_resolve_registered,NULL,&failed);
+        registry_unlock();
+        if (r != NVN_INDIRECT_RESOURCE_UNAVAILABLE || failed != 1 || memcmp(slots,previous,sizeof slots))
+            MDIE("indirect registry probe invalid descriptor");
+        handles[1] = 71;
+        registry_lock();
+        r = nvn_indirect_texture_bind(handles,sizeof handles,2,74u<<20,slots,4,0,2,
+                                      indirect_resolve_registered,NULL,&failed);
+        registry_unlock();
+        if (r != NVN_INDIRECT_RESOURCE_UNAVAILABLE || memcmp(slots,previous,sizeof slots))
+            MDIE("indirect registry probe invalid sampler");
+        id<MTLTexture> unresident = [g_dev newTextureWithDescriptor:d];
+        if (!unresident) MDIE("indirect registry probe unresident allocation");
+        tex_t tc = ta; tc.serial = 0xfffed103;
+        serial_put(tc.serial,unresident); mtl_reg_tex(71,&tc,NULL);
+        registry_lock();
+        r = nvn_indirect_texture_bind(handles,sizeof handles,2,73u<<20,slots,4,0,2,
+                                      indirect_resolve_registered,NULL,&failed);
+        registry_unlock();
+        if (r != NVN_INDIRECT_RESOURCE_UNAVAILABLE || memcmp(slots,previous,sizeof slots))
+            MDIE("indirect registry probe nonresident texture");
+        samp_par custom = clamp; custom.ws = 4; custom.border[0] = 0.5f;
+        mtl_reg_samp(75,&custom); mtl_reg_tex(71,&ta,NULL);
+        registry_lock();
+        r = nvn_indirect_texture_bind(handles,sizeof handles,2,75u<<20,slots,4,0,2,
+                                      indirect_resolve_registered,NULL,&failed);
+        registry_unlock();
+        if (r != NVN_INDIRECT_RESOURCE_UNAVAILABLE || memcmp(slots,previous,sizeof slots))
+            MDIE("indirect registry probe custom sampler");
+        int saved_pool_n = g_tpool_n; g_tpool_n = 71;
+        registry_lock();
+        r = nvn_indirect_texture_bind(handles,sizeof handles,2,73u<<20,slots,4,0,2,
+                                      indirect_resolve_registered,NULL,&failed);
+        registry_unlock(); g_tpool_n = saved_pool_n;
+        if (r != NVN_INDIRECT_RESOURCE_UNAVAILABLE || memcmp(slots,previous,sizeof slots))
+            MDIE("indirect registry probe texture pool bounds");
+        MTLTextureDescriptor *wrong = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float width:1 height:1 mipmapped:NO];
+        wrong.storageMode = MTLStorageModeShared; wrong.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> tex2d = [g_dev newTextureWithDescriptor:wrong];
+        if (!tex2d) MDIE("indirect registry probe 2d texture allocation");
+        res_add(tex2d); tc.serial = 0xfffed104;
+        serial_put(tc.serial,tex2d); mtl_reg_tex(71,&tc,NULL);
+        registry_lock();
+        r = nvn_indirect_texture_bind(handles,sizeof handles,2,73u<<20,slots,4,0,2,
+                                      indirect_resolve_registered,NULL,&failed);
+        registry_unlock();
+        if (r != NVN_INDIRECT_RESOURCE_UNAVAILABLE || memcmp(slots,previous,sizeof slots))
+            MDIE("indirect registry probe mismatched texture type");
+        d.pixelFormat = MTLPixelFormatR32Uint;
+        id<MTLTexture> integer = [g_dev newTextureWithDescriptor:d];
+        if (!integer) MDIE("indirect registry probe integer texture allocation");
+        res_add(integer); tc.serial = 0xfffed105;
+        serial_put(tc.serial,integer); mtl_reg_tex(71,&tc,NULL);
+        registry_lock();
+        r = nvn_indirect_texture_bind(handles,sizeof handles,2,73u<<20,slots,4,0,2,
+                                      indirect_resolve_registered,NULL,&failed);
+        registry_unlock();
+        if (r != NVN_INDIRECT_RESOURCE_UNAVAILABLE || memcmp(slots,previous,sizeof slots))
+            MDIE("indirect registry probe mismatched texture format");
+        checked += 9;
+        mtl_reg_tex(71,NULL,NULL);
+    }
     for (int kind = 0; kind < 3; kind++) {
         tex_t textures[2] = {0};
         for (int i = 0; i < 3; i++) {
